@@ -35,13 +35,6 @@ jobs:
           uv run python3 tools/install-build-deps --ui
           ./ui/build
 
-      - name: Setup Node.js (Correct Way)
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: 'npm'
-          cache-dependency-path: './packer/package.json'
-
       - name: Prepare Electron Project
         run: |
           mkdir packer
@@ -81,6 +74,15 @@ jobs:
             }
           }
           EOF
+        
+      - name: Setup Node.js (Correct Way)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: './packer/package.json'
+
+      
 
       - name: Package Windows App
         working-directory: ./packer
