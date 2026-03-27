@@ -3,14 +3,14 @@ name: Build and Release Perfetto Offline
 on:
   push:
     tags:
-      - 'v*' # 当推送以 v 开头的标签时触发，如 v1.0.1
-  workflow_dispatch: # 允许手动点击按钮触发
+      - 'v*' 
+  workflow_dispatch: 
 
 jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 赋予创建 Release 的权限
+      contents: write
 
     steps:
       - name: Checkout Perfetto
@@ -31,15 +31,24 @@ jobs:
       - name: Build Perfetto UI
         working-directory: ./perfetto
         run: |
+          # 使用 uv 托管 Python 脚本
           uv run python3 tools/install-build-deps --ui
           ./ui/build
+
+      - name: Setup Node.js (Correct Way)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: './packer/package.json'
 
       - name: Prepare Electron Project
         run: |
           mkdir packer
           cp -r perfetto/out/ui/ui/dist ./packer/ui
           cd packer
-          # 快速生成配置
+          
+          # 生成主进程文件
           cat <<EOF > main.js
           const { app, BrowserWindow } = require("electron");
           const path = require("path");
@@ -54,12 +63,15 @@ jobs:
           app.whenReady().then(createWindow);
           EOF
           
+          # 生成打包配置
           cat <<EOF > package.json
           {
             "name": "perfetto-offline",
-            "version": "${{ github.ref_name }}",
+            "version": "1.0.0",
             "main": "main.js",
-            "scripts": { "build": "electron-builder --win" },
+            "scripts": { 
+              "build": "electron-builder --win" 
+            },
             "build": {
               "appId": "com.perfetto.offline",
               "productName": "PerfettoOffline",
@@ -70,16 +82,18 @@ jobs:
           }
           EOF
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20 # 使用稳定的 LTS 版本
-  
       - name: Package Windows App
         working-directory: ./packer
         run: |
-          uvx --with nodejs npm install electron electron-builder --save-dev
-          uvx --with nodejs npm run build
+          # 使用真正的 npm 安装依赖
+          npm install electron electron-builder --save-dev
+          npm run build
+
+      - name: Upload Artifact (For Debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Perfetto-Windows-EXE
+          path: packer/dist/*.exe
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -87,4 +101,3 @@ jobs:
         with:
           files: packer/dist/*.exe
           generate_release_notes: true
-          tag_name: ${{ github.ref_name }}
