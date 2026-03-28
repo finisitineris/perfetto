@@ -42,7 +42,6 @@ jobs:
     needs: build-ui # 必须等待 build-ui 完成
     runs-on: windows-latest
     steps:
-      # 【新增步骤】：把源码也拉取到 Windows 节点，方便直接使用仓库里的图标
       - name: Checkout Perfetto Source
         uses: actions/checkout@v4
         with:
@@ -126,7 +125,7 @@ jobs:
               "files": [ "ui/**/*", "main.js", "package.json", "icon.ico" ],
               "win": { 
                 "target": "portable",
-                "icon": "icon.ico" // 指定生成的 .exe 的图标
+                "icon": "icon.ico"
               }
             }
           }
