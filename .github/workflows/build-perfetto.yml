@@ -1,13 +1,12 @@
-name: Build and Release Perfetto Offline
+name: Build Perfetto (Linux + Wine)
 
 on:
   push:
-    tags:
-      - 'v*' 
-  workflow_dispatch: 
+    tags: [ 'v*' ]
+  workflow_dispatch:
 
 jobs:
-  release:
+  build-and-package:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -20,10 +19,13 @@ jobs:
           fetch-depth: 1
           path: perfetto
 
-      - name: Install System Dependencies
+      - name: Install System Dependencies (Python & Wine32)
         run: |
+          # 开启 32 位架构支持并安装依赖
+          sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y python3-venv wine64
+          sudo apt-get install -y python3-venv
+          sudo apt-get install -y --no-install-recommends wine64 wine32
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -31,7 +33,6 @@ jobs:
       - name: Build Perfetto UI
         working-directory: ./perfetto
         run: |
-          # 使用 uv 托管 Python 脚本
           uv run python3 tools/install-build-deps --ui
           ./ui/build
 
@@ -62,9 +63,7 @@ jobs:
             "name": "perfetto-offline",
             "version": "1.0.0",
             "main": "main.js",
-            "scripts": { 
-              "build": "electron-builder --win" 
-            },
+            "scripts": { "build": "electron-builder --win" },
             "build": {
               "appId": "com.perfetto.offline",
               "productName": "PerfettoOffline",
@@ -74,32 +73,23 @@ jobs:
             }
           }
           EOF
-        
-      - name: Setup Node.js (Correct Way)
+
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
-          cache-dependency-path: './packer/package.json'
-
-      
 
       - name: Package Windows App
         working-directory: ./packer
+        env:
+          # 关闭 Wine 的所有调试输出和图形界面调用，防止 X11 报错
+          WINEDEBUG: -all
         run: |
-          # 使用真正的 npm 安装依赖
           npm install electron electron-builder --save-dev
           npm run build
 
-      - name: Upload Artifact (For Debug)
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Perfetto-Windows-EXE
           path: packer/dist/*.exe
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: packer/dist/*.exe
-          generate_release_notes: true
