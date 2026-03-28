@@ -13,7 +13,8 @@ jobs:
       - name: Checkout Perfetto
         uses: actions/checkout@v4
         with:
-          repository: google/perfetto
+          # 修改为你自己的 Fork 仓库
+          repository: finisitineris/perfetto
           fetch-depth: 1
           path: perfetto
 
@@ -48,16 +49,54 @@ jobs:
           name: perfetto-ui-dist
           path: packer/ui
 
-      - name: Prepare Electron Project
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Prepare Assets and Electron Project
         working-directory: ./packer
         shell: bash # 在 Windows Runner 中强制使用 bash 运行该脚本
         run: |
+          # 1. 初始化 npm 环境并安装图标处理工具
+          npm init -y
+          npm install png-to-ico axios --save-dev
+
+          # 2. 生成图标转换脚本
+          cat <<EOF > icon-gen.js
+          const fs = require('fs');
+          const axios = require('axios');
+          const pngToIco = require('png-to-ico');
+
+          const pngUrl = 'https://raw.githubusercontent.com/finisitineris/perfetto/main/ui/src/assets/logo-128.png';
+          const tempPng = 'temp-icon.png';
+          
+          async function convert() {
+            console.log('正在下载并转换图标...');
+            const writer = fs.createWriteStream(tempPng);
+            const res = await axios({ url: pngUrl, responseType: 'stream' });
+            res.data.pipe(writer);
+            await new Promise(r => writer.on('finish', r));
+            
+            const buf = await pngToIco(tempPng);
+            fs.writeFileSync('icon.ico', buf);
+            fs.unlinkSync(tempPng);
+            console.log('图标转换完成！');
+          }
+          convert();
+          EOF
+
+          # 3. 运行图标转换脚本
+          node icon-gen.js
+
+          # 4. 生成主进程文件 main.js (添加 icon 属性)
           cat <<EOF > main.js
           const { app, BrowserWindow } = require("electron");
           const path = require("path");
           function createWindow() {
             const win = new BrowserWindow({
               width: 1600, height: 1000,
+              icon: path.join(__dirname, "icon.ico"), // 运行时窗口图标
               webPreferences: { nodeIntegration: false, contextIsolation: true }
             });
             win.loadFile(path.join(__dirname, "ui/index.html"));
@@ -66,6 +105,7 @@ jobs:
           app.whenReady().then(createWindow);
           EOF
           
+          # 5. 生成打包配置 package.json (配置 win.icon)
           cat <<EOF > package.json
           {
             "name": "perfetto-offline",
@@ -76,16 +116,14 @@ jobs:
               "appId": "com.perfetto.offline",
               "productName": "PerfettoOffline",
               "directories": { "output": "dist" },
-              "files": [ "ui/**/*", "main.js", "package.json" ],
-              "win": { "target": "portable" }
+              "files": [ "ui/**/*", "main.js", "package.json", "icon.ico" ],
+              "win": { 
+                "target": "portable",
+                "icon": "icon.ico"  // 生成的 EXE 图标
+              }
             }
           }
           EOF
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
 
       - name: Package Windows App
         working-directory: ./packer
