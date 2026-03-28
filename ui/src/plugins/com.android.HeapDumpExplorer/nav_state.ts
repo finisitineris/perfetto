@@ -28,6 +28,7 @@ export type NavState =
     }
   | {view: 'bitmaps'; params: {id?: number; filterKey?: string}}
   | {view: 'strings'; params: {q?: string}}
+  | {view: 'arrays'; params: {arrayHash?: string}}
   | {view: 'flamegraph-objects'; params: {name?: string}};
 
 export function stateToSubpage(state: NavState): string {
@@ -58,6 +59,10 @@ export function stateToSubpage(state: NavState): string {
     case 'strings': {
       const q = state.params.q;
       return q ? `strings?q=${encodeURIComponent(q)}` : 'strings';
+    }
+    case 'arrays': {
+      const ah = state.params.arrayHash;
+      return ah ? `arrays?ah=${encodeURIComponent(ah)}` : 'arrays';
     }
     case 'flamegraph-objects': {
       const n = state.params.name;
@@ -125,6 +130,10 @@ export function subpageToState(subpage: string | undefined): NavState {
       const q = sp.get('q') ?? '';
       return {view: 'strings', params: q ? {q} : {}};
     }
+    case 'arrays': {
+      const ah = sp.get('ah') ?? undefined;
+      return {view: 'arrays', params: ah ? {arrayHash: ah} : {}};
+    }
     case 'flamegraph-objects': {
       const n = param ? decodeURIComponent(param) : undefined;
       return {view: 'flamegraph-objects', params: n ? {name: n} : {}};
@@ -152,6 +161,14 @@ export function navigate(
   nav = state;
   navigateCallback?.(stateToSubpage(state));
   m.redraw();
+}
+
+// Clear a single nav param without pushing a history entry.
+// Used after consuming a one-shot param (e.g. a filter from overview).
+export function clearNavParam(key: string): void {
+  const params = {...(nav.params as Record<string, unknown>)};
+  delete params[key];
+  nav = {view: nav.view, params} as NavState;
 }
 
 export function syncFromSubpage(subpage: string | undefined): void {

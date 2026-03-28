@@ -35,6 +35,7 @@ import InstancesView from './views/instances_view';
 import BitmapGalleryView from './views/bitmap_gallery_view';
 import ClassesView from './views/classes_view';
 import StringsView from './views/strings_view';
+import ArraysView from './views/arrays_view';
 import FlamegraphObjectsView from './views/flamegraph_objects_view';
 
 // Selection set by HeapProfile's "Open in Heapdump Explorer" action.
@@ -121,9 +122,6 @@ function buildTabs(
       key: 'bitmaps',
       title: 'Bitmaps',
       content: m(BitmapGalleryView, {
-        // Key on filterKey so the component remounts when the filter changes,
-        // ensuring initialFilters on the inner DataGrid takes effect.
-        key: state.view === 'bitmaps' ? state.params.filterKey ?? '' : '',
         engine,
         navigate,
         hasFieldValues: overview.hasFieldValues,
@@ -135,10 +133,21 @@ function buildTabs(
       key: 'strings',
       title: 'Strings',
       content: m(StringsView, {
-        key: state.view === 'strings' ? state.params.q ?? '' : '',
         engine,
         navigate,
         initialQuery: state.view === 'strings' ? state.params.q : undefined,
+        hasFieldValues: overview.hasFieldValues,
+      }),
+    },
+    {
+      key: 'arrays',
+      title: 'Arrays',
+      content: m(ArraysView, {
+        key: state.view === 'arrays' ? state.params.arrayHash ?? '' : '',
+        engine,
+        navigate,
+        initialArrayHash:
+          state.view === 'arrays' ? state.params.arrayHash : undefined,
         hasFieldValues: overview.hasFieldValues,
       }),
     },
