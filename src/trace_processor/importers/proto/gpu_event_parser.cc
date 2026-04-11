@@ -32,6 +32,7 @@
 #include "perfetto/protozero/field.h"
 #include "src/trace_processor/importers/common/args_tracker.h"
 #include "src/trace_processor/importers/common/event_tracker.h"
+#include "src/trace_processor/importers/common/gpu_tracker.h"
 #include "src/trace_processor/importers/common/import_logs_tracker.h"
 #include "src/trace_processor/importers/common/process_tracker.h"
 #include "src/trace_processor/importers/common/slice_tracker.h"
@@ -118,7 +119,8 @@ using protos::pbzero::VulkanMemoryEvent;
 constexpr auto kRenderStageBlueprint = TrackCompressor::SliceBlueprint(
     "gpu_render_stage",
     tracks::DimensionBlueprints(
-        tracks::kGpuDimensionBlueprint,
+        tracks::kUgpuDimensionBlueprint,
+        tracks::kGpuIdDimensionBlueprint,
         tracks::StringDimensionBlueprint("render_stage_source"),
         tracks::UintDimensionBlueprint("hwqueue_id"),
         tracks::StringIdDimensionBlueprint("hwqueue_name")),
@@ -146,6 +148,7 @@ GpuEventParser::GpuEventParser(TraceProcessorContext* context)
       upid_id_(context->storage->InternString("upid")),
       pid_id_(context_->storage->InternString("pid")),
       tid_id_(context_->storage->InternString("tid")),
+      category_id_(context->storage->InternString("render_stage_category")),
       description_id_(context->storage->InternString("description")),
       correlation_id_(context->storage->InternString("correlation_id")),
       counter_id_key_id_(context->storage->InternString("counter_id")),
@@ -290,8 +293,11 @@ TrackId GpuEventParser::InternGpuCounterTrack(
   auto desc_id = context_->storage->InternString(spec.description());
   auto unit_id = FormatCounterUnit(spec);
 
+  auto ugpu =
+      context_->gpu_tracker->GetOrCreateGpu(static_cast<uint32_t>(gpu_id));
   return context_->track_tracker->InternTrack(
-      tracks::kGpuCounterBlueprint, tracks::Dimensions(gpu_id, name),
+      tracks::kGpuCounterBlueprint,
+      tracks::Dimensions(ugpu.value, static_cast<uint32_t>(gpu_id), name),
       tracks::DynamicName(name_id),
       [&, this](ArgsTracker::BoundInserter& inserter) {
         inserter.AddArg(description_id_, Variadic::String(desc_id));
@@ -506,9 +512,10 @@ void GpuEventParser::InsertTrackForUninternedRenderStage(
   // Mark this as handled.
   *it = false;
 
+  auto ugpu = context_->gpu_tracker->GetOrCreateGpu(gpu_id);
   auto factory = context_->track_compressor->CreateTrackFactory(
       kRenderStageBlueprint,
-      tracks::Dimensions(gpu_id, "id", hw_queue_id, kNullStringId),
+      tracks::Dimensions(ugpu.value, gpu_id, "id", hw_queue_id, kNullStringId),
       tracks::DynamicName(name),
       [&, this](ArgsTracker::BoundInserter& inserter) {
         inserter.AddArg(description_id_, Variadic::String(description));
@@ -671,9 +678,10 @@ void GpuEventParser::ParseGpuRenderStageEvent(
                                       ? context_->storage->InternString(
                                             command_buffer_name.value().c_str())
                                       : kNullStringId;
+    auto ugpu = context_->gpu_tracker->GetOrCreateGpu(gpu_id);
     TrackId track_id = context_->track_compressor->InternScoped(
         kRenderStageBlueprint,
-        tracks::Dimensions(gpu_id, base::StringView(source),
+        tracks::Dimensions(ugpu.value, gpu_id, base::StringView(source),
                            static_cast<uint32_t>(hw_queue_id), dimension_name),
         ts, static_cast<int64_t>(event.duration()),
         tracks::DynamicName(track_name),
@@ -690,7 +698,7 @@ void GpuEventParser::ParseGpuRenderStageEvent(
     } else {
       name_id = GetFullStageName(sequence_state, event);
     }
-    context_->slice_tracker->Scoped(
+    auto opt_slice_id = context_->slice_tracker->Scoped(
         ts, track_id, kNullStringId, name_id,
         static_cast<int64_t>(event.duration()),
         [&](ArgsTracker::BoundInserter* inserter) {
@@ -700,7 +708,9 @@ void GpuEventParser::ParseGpuRenderStageEvent(
                 protos::pbzero::InternedData::kGpuSpecificationsFieldNumber,
                 protos::pbzero::InternedGpuRenderStageSpecification>(stage_iid);
             if (decoder) {
-              // TODO: Add RenderStageCategory to gpu_slice table.
+              inserter->AddArg(
+                  category_id_,
+                  Variadic::Integer(static_cast<int64_t>(decoder->category())));
               inserter->AddArg(description_id_,
                                Variadic::String(context_->storage->InternString(
                                    decoder->description())));
@@ -761,6 +771,19 @@ void GpuEventParser::ParseGpuRenderStageEvent(
               Variadic::Integer(context_->process_tracker->GetOrCreateProcess(
                   static_cast<uint32_t>(pid))));
         });
+
+    if (opt_slice_id) {
+      SliceId slice_id = *opt_slice_id;
+
+      if (event.has_event_id()) {
+        context_->gpu_tracker->AddGpuRenderStageSlice(event.event_id(),
+                                                      slice_id);
+      }
+
+      for (auto it = event.event_wait_ids(); it; ++it) {
+        context_->gpu_tracker->AddEventWait(*it, slice_id);
+      }
+    }
   }
 }
 
@@ -1057,18 +1080,23 @@ void GpuEventParser::ParseVulkanApiEvent(int64_t ts, ConstBytes blob) {
 void GpuEventParser::ParseGpuMemTotalEvent(int64_t ts, ConstBytes blob) {
   protos::pbzero::GpuMemTotalEvent::Decoder gpu_mem_total(blob);
 
+  const uint32_t gpu_id = gpu_mem_total.gpu_id();
+  auto ugpu = context_->gpu_tracker->GetOrCreateGpu(gpu_id);
+
   TrackId track = kInvalidTrackId;
   const uint32_t pid = gpu_mem_total.pid();
   if (pid == 0) {
     // Pid 0 is used to indicate the global total
-    track =
-        context_->track_tracker->InternTrack(tracks::kGlobalGpuMemoryBlueprint);
+    track = context_->track_tracker->InternTrack(
+        tracks::kGlobalGpuMemoryBlueprint,
+        tracks::Dimensions(ugpu.value, gpu_id));
   } else {
     // Process emitting the packet can be different from the pid in the event.
     UniqueTid utid = context_->process_tracker->UpdateThread(pid, pid);
     UniquePid upid = context_->storage->thread_table()[utid].upid().value_or(0);
     track = context_->track_tracker->InternTrack(
-        tracks::kProcessGpuMemoryBlueprint, tracks::Dimensions(upid));
+        tracks::kProcessGpuMemoryBlueprint,
+        tracks::Dimensions(ugpu.value, gpu_id, upid));
   }
   context_->event_tracker->PushCounter(
       ts, static_cast<double>(gpu_mem_total.size()), track);

@@ -15,7 +15,7 @@
 
 from python.generators.diff_tests.testing import Path, DataPath, Metric
 from python.generators.diff_tests.testing import Csv, Json, TextProto
-from python.generators.diff_tests.testing import DiffTestBlueprint
+from python.generators.diff_tests.testing import DiffTestBlueprint, TraceInjector
 from python.generators.diff_tests.testing import TestSuite
 
 
@@ -52,14 +52,62 @@ class GraphicsGpuTrace(TestSuite):
     return DiffTestBlueprint(
         trace=Path('gpu_counters.py'),
         query="""
+        SELECT gpu, name, vendor, model, architecture, uuid, machine_id
+        FROM gpu
+        ORDER BY gpu;
+        """,
+        out=Csv("""
+        "gpu","name","vendor","model","architecture","uuid","machine_id"
+        0,"[NULL]","[NULL]","[NULL]","[NULL]","[NULL]",0
+        1,"[NULL]","[NULL]","[NULL]","[NULL]","[NULL]",0
+        """))
+
+  def test_gpu_info(self):
+    return DiffTestBlueprint(
+        trace=Path('gpu_info.textproto'),
+        query="""
+        SELECT gpu, name, vendor, model, architecture, uuid, pci_bdf
+        FROM gpu
+        ORDER BY gpu;
+        """,
+        out=Csv("""
+        "gpu","name","vendor","model","architecture","uuid","pci_bdf"
+        0,"NVIDIA A100-SXM4-80GB","NVIDIA","A100","Ampere","0123456789abcdef0123456789abcdef","0000:01:00.0"
+        1,"NVIDIA A100-SXM4-80GB","NVIDIA","A100","Ampere","abcdefabcdefabcdabcdefabcdefabcd","0000:02:00.0"
+        """))
+
+  def test_gpu_info_extra_args(self):
+    return DiffTestBlueprint(
+        trace=Path('gpu_info.textproto'),
+        query="""
+        SELECT
+          g.gpu,
+          args.key,
+          args.string_value
+        FROM gpu g
+        JOIN args USING (arg_set_id)
+        ORDER BY g.gpu, args.key;
+        """,
+        out=Csv("""
+        "gpu","key","string_value"
+        0,"driver_version","535.129.03"
+        0,"memory_total_mb","81920"
+        """))
+
+  def test_gpu_table_machine_id(self):
+    return DiffTestBlueprint(
+        trace=Path('gpu_counters.py'),
+        trace_modifier=TraceInjector(['gpu_counter_event'],
+                                     {'machine_id': 1001}),
+        query="""
         SELECT gpu, machine_id
         FROM gpu
         ORDER BY gpu;
         """,
         out=Csv("""
         "gpu","machine_id"
-        0,0
-        1,0
+        0,1
+        1,1
         """))
 
   def test_gpu_counter_specs(self):
@@ -119,6 +167,7 @@ class GraphicsGpuTrace(TestSuite):
               'submission_id',
               'hw_queue_id',
               'render_subpasses',
+              'render_stage_category',
               'upid'
             )
           ) args USING (arg_set_id)
@@ -188,6 +237,7 @@ class GraphicsGpuTrace(TestSuite):
               'submission_id',
               'hw_queue_id',
               'render_subpasses',
+              'render_stage_category',
               'upid'
             )
           ) args USING (arg_set_id)
@@ -474,3 +524,20 @@ class GraphicsGpuTrace(TestSuite):
           10,250.000000,"CounterB",1
           20,0.000000,"CounterB",1
         """))
+
+  def test_gpu_render_stages_flow(self):
+    return DiffTestBlueprint(
+        trace=Path('gpu_render_stages_flow.textproto'),
+        query='''
+          SELECT
+            slice_out.name AS source_slice,
+            slice_in.name AS dest_slice
+          FROM flow
+          JOIN slice AS slice_out ON flow.slice_out = slice_out.id
+          JOIN slice AS slice_in ON flow.slice_in = slice_in.id
+          ORDER BY slice_out.ts, slice_in.ts;
+        ''',
+        out=Csv('''
+          "source_slice","dest_slice"
+          "softmax","matmul"
+        '''))
