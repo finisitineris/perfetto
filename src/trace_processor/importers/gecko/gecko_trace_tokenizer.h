@@ -54,10 +54,16 @@ class GeckoTraceTokenizer : public ChunkedTraceReader {
   void OnEventsFullyExtracted() override {}
 
  private:
-  // Processes frames and stacks, returning callsites.
+  // Processes frames and stacks, returning callsites. `strings` is the string
+  // table to use for resolving frame names; for traces with a `shared` block
+  // that owns the string table this is `shared.strings` rather than
+  // `t.strings`.
   std::vector<Callsite> ProcessPreprocessedFramesAndStacks(
-      const GeckoThread& t);
-  std::vector<Callsite> ProcessLegacyFramesAndStacks(const GeckoThread& t);
+      const GeckoThread& t,
+      const std::vector<std::string>& strings);
+  std::vector<Callsite> ProcessLegacyFramesAndStacks(
+      const GeckoThread& t,
+      const std::vector<std::string>& strings);
 
   // Processes samples using pre-built callsites.
   void ProcessSamples(const GeckoThread& t,
@@ -65,12 +71,18 @@ class GeckoTraceTokenizer : public ChunkedTraceReader {
   void ProcessLegacySamples(const GeckoThread& t,
                             const std::vector<Callsite>& callsites);
 
+  // Emits a MarkerEvent for each entry in `t.markers`. `strings_for_names`
+  // resolves the marker name index (which may live in a shared string table
+  // when the file uses the modern `shared` block).
+  void ProcessMarkers(const GeckoThread& t,
+                      const std::vector<std::string>& strings_for_names,
+                      const std::vector<std::string>& category_names);
+
   FrameId InternFrame(base::StringView name);
 
   TraceProcessorContext* const context_;
   std::unique_ptr<TraceSorter::Stream<GeckoEvent>> stream_;
   std::string pending_json_;
-  ClockTracker::ClockId trace_file_clock_;
 
   // Shared across all threads to avoid creating duplicate mappings.
   DummyMemoryMapping* dummy_mapping_ = nullptr;

@@ -69,6 +69,7 @@ using ArgSetId = uint32_t;
 using TrackId = tables::TrackTable_Id;
 
 using CounterId = tables::CounterTable_Id;
+using StateId = tables::StateTable_Id;
 
 using SliceId = tables::SliceTable_Id;
 
@@ -193,13 +194,6 @@ class TraceStorage {
     std::deque<int64_t> times_ended_;
   };
 
-  struct Stats {
-    using IndexMap = std::map<int, int64_t>;
-    int64_t value = 0;
-    IndexMap indexed_values;
-  };
-  using StatsMap = std::array<Stats, stats::kNumKeys>;
-
   // Return an unique identifier for the contents of each string.
   // The string is copied internally and can be destroyed after this called.
   // Virtual for testing.
@@ -214,102 +208,6 @@ class TraceStorage {
   }
   virtual StringId InternString(std::string_view str) {
     return InternString(base::StringView(str.data(), str.size()));
-  }
-
-  // Example usage: SetStats(stats::android_log_num_failed, 42);
-  // TODO(lalitm): make these correctly work across machines and across
-  // traces.
-  void SetStats(size_t key, int64_t value) {
-    PERFETTO_DCHECK(key < stats::kNumKeys);
-    PERFETTO_DCHECK(stats::kTypes[key] == stats::kSingle);
-    stats_[key].value = value;
-  }
-
-  // Example usage: IncrementStats(stats::android_log_num_failed, -1);
-  // TODO(lalitm): make these correctly work across machines and across
-  // traces.
-  void IncrementStats(size_t key, int64_t increment = 1) {
-    PERFETTO_DCHECK(key < stats::kNumKeys);
-    PERFETTO_DCHECK(stats::kTypes[key] == stats::kSingle);
-    stats_[key].value += increment;
-  }
-
-  // Example usage: IncrementIndexedStats(stats::cpu_failure, 1);
-  // TODO(lalitm): make these correctly work across machines and across
-  // traces.
-  void IncrementIndexedStats(size_t key, int index, int64_t increment = 1) {
-    PERFETTO_DCHECK(key < stats::kNumKeys);
-    PERFETTO_DCHECK(stats::kTypes[key] == stats::kIndexed);
-    stats_[key].indexed_values[index] += increment;
-  }
-
-  // Example usage: SetIndexedStats(stats::cpu_failure, 1, 42);
-  // TODO(lalitm): make these correctly work across machines and across
-  // traces.
-  void SetIndexedStats(size_t key, int index, int64_t value) {
-    PERFETTO_DCHECK(key < stats::kNumKeys);
-    PERFETTO_DCHECK(stats::kTypes[key] == stats::kIndexed);
-    stats_[key].indexed_values[index] = value;
-  }
-
-  // Example usage: opt_cpu_failure = GetIndexedStats(stats::cpu_failure, 1);
-  // TODO(lalitm): make these correctly work across machines and across
-  // traces.
-  std::optional<int64_t> GetIndexedStats(size_t key, int index) {
-    PERFETTO_DCHECK(key < stats::kNumKeys);
-    PERFETTO_DCHECK(stats::kTypes[key] == stats::kIndexed);
-    auto kv = stats_[key].indexed_values.find(index);
-    if (kv != stats_[key].indexed_values.end()) {
-      return kv->second;
-    }
-    return std::nullopt;
-  }
-
-  // TODO(lalitm): make these correctly work across machines and across
-  // traces.
-  int64_t GetStats(size_t key) {
-    PERFETTO_DCHECK(key < stats::kNumKeys);
-    PERFETTO_DCHECK(stats::kTypes[key] == stats::kSingle);
-    return stats_[key].value;
-  }
-
-  class ScopedStatsTracer {
-   public:
-    ScopedStatsTracer(TraceStorage* storage, size_t key)
-        : storage_(storage), key_(key), start_ns_(base::GetWallTimeNs()) {}
-
-    ~ScopedStatsTracer() {
-      if (!storage_)
-        return;
-      auto delta_ns = base::GetWallTimeNs() - start_ns_;
-      storage_->IncrementStats(key_, delta_ns.count());
-    }
-
-    ScopedStatsTracer(ScopedStatsTracer&& other) noexcept { MoveImpl(&other); }
-
-    ScopedStatsTracer& operator=(ScopedStatsTracer&& other) {
-      MoveImpl(&other);
-      return *this;
-    }
-
-   private:
-    ScopedStatsTracer(const ScopedStatsTracer&) = delete;
-    ScopedStatsTracer& operator=(const ScopedStatsTracer&) = delete;
-
-    void MoveImpl(ScopedStatsTracer* other) {
-      storage_ = other->storage_;
-      key_ = other->key_;
-      start_ns_ = other->start_ns_;
-      other->storage_ = nullptr;
-    }
-
-    TraceStorage* storage_;
-    size_t key_;
-    base::TimeNanos start_ns_;
-  };
-
-  ScopedStatsTracer TraceExecutionTimeIntoStats(size_t key) {
-    return ScopedStatsTracer(this, key);
   }
 
   // Reading methods.
@@ -416,9 +314,22 @@ class TraceStorage {
   tables::CounterTable* mutable_counter_table() {
     return mutable_table<tables::CounterTable>();
   }
+  const tables::StateTable& state_table() const {
+    return table<tables::StateTable>();
+  }
+  tables::StateTable* mutable_state_table() {
+    return mutable_table<tables::StateTable>();
+  }
 
   const SqlStats& sql_stats() const { return sql_stats_; }
   SqlStats* mutable_sql_stats() { return &sql_stats_; }
+
+  const tables::StatsTable& stats_table() const {
+    return table<tables::StatsTable>();
+  }
+  tables::StatsTable* mutable_stats_table() {
+    return mutable_table<tables::StatsTable>();
+  }
 
   const tables::AndroidAflagsTable& android_aflags_table() const {
     return table<tables::AndroidAflagsTable>();
@@ -436,11 +347,11 @@ class TraceStorage {
     return mutable_table<tables::AndroidCpuPerUidTrackTable>();
   }
 
-  const tables::AndroidLogTable& android_log_table() const {
-    return table<tables::AndroidLogTable>();
+  const tables::LogTable& log_table() const {
+    return table<tables::LogTable>();
   }
-  tables::AndroidLogTable* mutable_android_log_table() {
-    return mutable_table<tables::AndroidLogTable>();
+  tables::LogTable* mutable_log_table() {
+    return mutable_table<tables::LogTable>();
   }
 
   const tables::AndroidDumpstateTable& android_dumpstate_table() const {
@@ -473,8 +384,6 @@ class TraceStorage {
   mutable_android_input_event_dispatch_table() {
     return mutable_table<tables::AndroidInputEventDispatchTable>();
   }
-
-  const StatsMap& stats() const { return stats_; }
 
   const tables::MetadataTable& metadata_table() const {
     return table<tables::MetadataTable>();
@@ -556,6 +465,13 @@ class TraceStorage {
     return mutable_table<tables::GpuTable>();
   }
 
+  const tables::InterruptMappingTable& interrupt_mapping_table() const {
+    return table<tables::InterruptMappingTable>();
+  }
+  tables::InterruptMappingTable* mutable_interrupt_mapping_table() {
+    return mutable_table<tables::InterruptMappingTable>();
+  }
+
   const tables::CpuFreqTable& cpu_freq_table() const {
     return table<tables::CpuFreqTable>();
   }
@@ -605,6 +521,31 @@ class TraceStorage {
   }
   tables::AndroidUserListTable* mutable_user_list_table() {
     return mutable_table<tables::AndroidUserListTable>();
+  }
+
+  const tables::HeapGraphTable& heap_graph_table() const {
+    return table<tables::HeapGraphTable>();
+  }
+  tables::HeapGraphTable* mutable_heap_graph_table() {
+    return mutable_table<tables::HeapGraphTable>();
+  }
+
+  const tables::HeapGraphThreadCallsiteTable& heap_graph_thread_callsite_table()
+      const {
+    return table<tables::HeapGraphThreadCallsiteTable>();
+  }
+  tables::HeapGraphThreadCallsiteTable*
+  mutable_heap_graph_thread_callsite_table() {
+    return mutable_table<tables::HeapGraphThreadCallsiteTable>();
+  }
+
+  const tables::HeapGraphJavaOomeDetailsTable&
+  heap_graph_java_oome_details_table() const {
+    return table<tables::HeapGraphJavaOomeDetailsTable>();
+  }
+  tables::HeapGraphJavaOomeDetailsTable*
+  mutable_heap_graph_java_oome_details_table() {
+    return mutable_table<tables::HeapGraphJavaOomeDetailsTable>();
   }
 
   const tables::AndroidGameInterventionListTable&
@@ -1172,8 +1113,6 @@ class TraceStorage {
   // One entry for each unique string in the trace.
   StringPool string_pool_;
 
-  // Stats about parsing the trace.
-  StatsMap stats_{};
   VirtualTrackSlices virtual_track_slices_;
   SqlStats sql_stats_;
 

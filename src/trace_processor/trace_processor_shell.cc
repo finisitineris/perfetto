@@ -149,6 +149,9 @@ Usage: %s [command] [flags] [trace_file]
 
 If no command is given, opens an interactive SQL shell on the trace file.
 
+trace_file can be a local path, an http(s):// URL, or a Perfetto UI share link
+(https://ui.perfetto.dev/#!/?s=<hash>).
+
 Commands:
   query         Load a trace and run a SQL query.
   interactive   Interactive SQL shell (default if no command is given).
@@ -175,6 +178,8 @@ Examples:
   tp server http                                    Start HTTP server.
   tp summarize --metrics-v2 all trace.pb            Summarize a trace.
   tp convert json trace.pb out.json                 Convert to JSON.
+  tp query "https://.../trace.pftrace" "SELECT ..." Query a trace from a URL.
+  tp "https://ui.perfetto.dev/#!/?s=<hash>"         Open a UI share link.
 
 Classic interface:
   The previous flat-flag interface (-q, --httpd, --summary, -e, etc.) is
@@ -740,8 +745,16 @@ class DefaultPlatformInterface : public TraceProcessorShell::PlatformInterface {
       TraceProcessor* trace_processor,
       const std::string& path,
       std::function<void(size_t)> progress_callback) override {
+    // The shell opts into loading traces directly from http(s) URLs and from
+    // Perfetto UI share links; the user opts in by passing such a path. Bytes
+    // downloaded this way are cached on local disk so re-running on the same
+    // URL doesn't re-download.
+    ReadTraceArgs args;
+    args.allow_http = true;
+    args.allow_perfetto_ui_links = true;
+    args.cache_downloads = true;
     return ReadTraceUnfinalized(trace_processor, path.c_str(),
-                                progress_callback);
+                                progress_callback, args);
   }
 };
 
@@ -955,9 +968,15 @@ base::Status TraceProcessorShell::Run(int argc, char** argv) {
   };
 
   // Determine which subcommand to dispatch to.
+  //
+  // For subcommands that themselves consume a positional mode argument
+  // (e.g. "server http", "server stdio", "export sqlite"), emit all flags
+  // *before* the mode positional. Our Windows getopt_compat implementation
+  // does not GNU-style permute argv, so any flag appearing after a positional
+  // would be left as a positional, which would then be misinterpreted as the
+  // trace file by the subcommand.
   if (options.enable_httpd) {
     args.emplace_back("server");
-    args.emplace_back("http");
     if (!options.port_number.empty()) {
       args.emplace_back("--port");
       args.emplace_back(options.port_number);
@@ -971,12 +990,13 @@ base::Status TraceProcessorShell::Run(int argc, char** argv) {
       args.emplace_back(o);
     }
     add_global_flags();
+    args.emplace_back("http");
     if (!options.trace_file_path.empty())
       args.emplace_back(options.trace_file_path);
   } else if (options.enable_stdiod) {
     args.emplace_back("server");
-    args.emplace_back("stdio");
     add_global_flags();
+    args.emplace_back("stdio");
     if (!options.trace_file_path.empty())
       args.emplace_back(options.trace_file_path);
   } else if (options.summary) {
@@ -1040,10 +1060,10 @@ base::Status TraceProcessorShell::Run(int argc, char** argv) {
           "Use the 'export' subcommand directly.");
     }
     args.emplace_back("export");
-    args.emplace_back("sqlite");
     args.emplace_back("-o");
     args.emplace_back(options.export_file_path);
     add_global_flags();
+    args.emplace_back("sqlite");
     if (!options.trace_file_path.empty())
       args.emplace_back(options.trace_file_path);
   } else if (!options.query_file_path.empty() ||

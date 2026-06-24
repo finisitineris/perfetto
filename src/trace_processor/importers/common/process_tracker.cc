@@ -26,6 +26,7 @@
 #include "perfetto/ext/base/string_view.h"
 #include "perfetto/public/compiler.h"
 #include "src/trace_processor/importers/common/args_tracker.h"
+#include "src/trace_processor/importers/common/stats_tracker.h"
 #include "src/trace_processor/storage/stats.h"
 #include "src/trace_processor/storage/trace_storage.h"
 #include "src/trace_processor/tables/metadata_tables_py.h"
@@ -430,6 +431,24 @@ void ProcessTracker::SetProcessUid(UniquePid upid, uint32_t uid) {
   rr.set_android_user_id(uid / 100000);
 }
 
+void ProcessTracker::SetProcessSortIndex(UniquePid upid,
+                                         int32_t sort_index,
+                                         SortIndexPriority priority) {
+  auto* current = process_sort_indexes_.Find(upid);
+  if (!current || priority >= current->priority) {
+    process_sort_indexes_.Insert(upid, {sort_index, priority});
+  }
+}
+
+void ProcessTracker::SetThreadSortIndex(UniqueTid utid,
+                                        int32_t sort_index,
+                                        SortIndexPriority priority) {
+  auto* current = thread_sort_indexes_.Find(utid);
+  if (!current || priority >= current->priority) {
+    thread_sort_indexes_.Insert(utid, {sort_index, priority});
+  }
+}
+
 void ProcessTracker::UpdateProcessName(UniquePid upid,
                                        StringId process_name_id,
                                        ProcessNamePriority priority) {
@@ -547,7 +566,7 @@ void ProcessTracker::AssociateThreads(UniqueTid utid1,
     // Cannot associate two threads that belong to two different processes.
     PERFETTO_ELOG("Process tracker failure. Cannot associate threads %ld, %ld",
                   static_cast<long>(rr1.tid()), static_cast<long>(rr2.tid()));
-    context_->storage->IncrementStats(stats::process_tracker_errors);
+    context_->stats_tracker->IncrementStats(stats::process_tracker_errors);
     return;
   }
 
@@ -674,6 +693,17 @@ ArgsTracker::BoundInserter ProcessTracker::AddArgsToThread(UniqueTid utid) {
 }
 
 void ProcessTracker::OnEventsFullyExtracted() {
+  for (auto it = process_sort_indexes_.GetIterator(); it; ++it) {
+    auto inserter = AddArgsToProcess(it.key());
+    inserter.AddArg(context_->storage->InternString("process_sort_index_hint"),
+                    Variadic::Integer(it.value().value));
+  }
+  for (auto it = thread_sort_indexes_.GetIterator(); it; ++it) {
+    auto inserter = AddArgsToThread(it.key());
+    inserter.AddArg(context_->storage->InternString("thread_sort_index_hint"),
+                    Variadic::Integer(it.value().value));
+  }
+
   args_tracker_.Flush();
   tids_.Clear();
   pids_.Clear();
@@ -681,6 +711,8 @@ void ProcessTracker::OnEventsFullyExtracted() {
   pending_parent_assocs_.clear();
   thread_name_priorities_.clear();
   process_name_priorities_.clear();
+  process_sort_indexes_.Clear();
+  thread_sort_indexes_.Clear();
   trusted_pids_.clear();
   namespaced_threads_.clear();
   namespaced_processes_.clear();

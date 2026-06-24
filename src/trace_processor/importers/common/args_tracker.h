@@ -30,10 +30,12 @@
 #include "src/trace_processor/tables/android_tables_py.h"
 #include "src/trace_processor/tables/counter_tables_py.h"
 #include "src/trace_processor/tables/flow_tables_py.h"
+#include "src/trace_processor/tables/log_tables_py.h"
 #include "src/trace_processor/tables/memory_tables_py.h"
 #include "src/trace_processor/tables/metadata_tables_py.h"
 #include "src/trace_processor/tables/profiler_tables_py.h"
 #include "src/trace_processor/tables/slice_tables_py.h"
+#include "src/trace_processor/tables/state_tables_py.h"
 #include "src/trace_processor/tables/trace_proto_tables_py.h"
 #include "src/trace_processor/tables/track_tables_py.h"
 #include "src/trace_processor/tables/winscope_tables_py.h"
@@ -136,6 +138,10 @@ class ArgsTracker {
     return AddArgsTo(context_->storage->mutable_slice_table(), id);
   }
 
+  BoundInserter AddArgsTo(tables::StateTable::Id id) {
+    return AddArgsTo(context_->storage->mutable_state_table(), id);
+  }
+
   BoundInserter AddArgsTo(tables::FlowTable::Id id) {
     return AddArgsTo(context_->storage->mutable_flow_table(), id);
   }
@@ -219,14 +225,14 @@ class ArgsTracker {
 
   BoundInserter AddArgsTo(MetadataId id) {
     auto* table = context_->storage->mutable_metadata_table();
-    uint32_t row = table->FindById(id)->ToRowNumber().row_number();
+    uint32_t row = (*table)[id].ToRowNumber().row_number();
     return BoundInserter(this, &table->dataframe(),
                          tables::MetadataTable::ColumnIndex::int_value, row);
   }
 
   BoundInserter AddArgsTo(TrackId id) {
     auto* table = context_->storage->mutable_track_table();
-    uint32_t row = table->FindById(id)->ToRowNumber().row_number();
+    uint32_t row = (*table)[id].ToRowNumber().row_number();
     return BoundInserter(this, &table->dataframe(),
                          tables::TrackTable::ColumnIndex::source_arg_set_id,
                          row);
@@ -266,6 +272,10 @@ class ArgsTracker {
     return AddArgsTo(context_->storage->mutable_trace_import_logs_table(), id);
   }
 
+  BoundInserter AddArgsTo(tables::LogTable::Id id) {
+    return AddArgsTo(context_->storage->mutable_log_table(), id);
+  }
+
   // Returns a CompactArgSet which contains the args inserted into this
   // ArgsTracker. Requires that every arg in this tracker was inserted for the
   // "arg_set_id" column given by |column| at the given |row_number|.
@@ -285,10 +295,17 @@ class ArgsTracker {
   // Virtual for testing.
   virtual void Flush();
 
+  // Resets state for reuse (retaining buffer capacity); does not commit. Call
+  // Flush() first if pending args still need writing.
+  void Clear() {
+    args_.clear();
+    array_indexes_.Clear();
+  }
+
  private:
   template <typename T>
   BoundInserter AddArgsTo(T* table, typename T::Id id) {
-    uint32_t row = table->FindById(id)->ToRowNumber().row_number();
+    uint32_t row = (*table)[id].ToRowNumber().row_number();
     return BoundInserter(this, &table->dataframe(), T::ColumnIndex::arg_set_id,
                          row);
   }

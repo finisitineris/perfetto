@@ -31,9 +31,11 @@
 #include "src/trace_processor/importers/common/clock_tracker.h"
 #include "src/trace_processor/importers/common/global_args_tracker.h"
 #include "src/trace_processor/importers/common/global_metadata_tracker.h"
+#include "src/trace_processor/importers/common/global_stats_tracker.h"
 #include "src/trace_processor/importers/common/import_logs_tracker.h"
 #include "src/trace_processor/importers/common/machine_tracker.h"
 #include "src/trace_processor/importers/common/metadata_tracker.h"
+#include "src/trace_processor/importers/common/stats_tracker.h"
 #include "src/trace_processor/importers/proto/additional_modules.h"
 #include "src/trace_processor/sorter/trace_sorter.h"
 #include "src/trace_processor/storage/stats.h"
@@ -66,17 +68,20 @@ class ProtoTraceReaderTest : public ::testing::Test {
         std::make_unique<MachineTracker>(&host_context_, kDefaultMachineId);
     host_context_.global_args_tracker =
         std::make_unique<GlobalArgsTracker>(host_context_.storage.get());
+    host_context_.global_stats_tracker =
+        std::make_unique<GlobalStatsTracker>(host_context_.storage.get());
+    host_context_.stats_tracker =
+        std::make_unique<StatsTracker>(&host_context_);
     host_context_.import_logs_tracker =
         std::make_unique<ImportLogsTracker>(&host_context_, TraceId(1));
     host_context_.trace_time_state = std::make_unique<TraceTimeState>(
         ClockId::Machine(protos::pbzero::BUILTIN_CLOCK_BOOTTIME));
-    primary_sync_ = std::make_unique<ClockSynchronizer>(
-        host_context_.trace_time_state.get(),
-        std::make_unique<ClockSynchronizerListenerImpl>(&host_context_));
+    host_context_.clock_sync =
+        TraceProcessorContextPtr<ClockSynchronizer>::MakeRoot(
+            host_context_.trace_time_state.get(),
+            std::make_unique<ClockSynchronizerListenerImpl>(&host_context_));
     host_context_.clock_tracker = std::make_unique<ClockTracker>(
-        &host_context_,
-        std::make_unique<ClockSynchronizerListenerImpl>(&host_context_),
-        primary_sync_.get(), true);
+        &host_context_, host_context_.clock_sync.get(), /*is_primary=*/true);
     host_context_.global_metadata_tracker =
         std::make_unique<GlobalMetadataTracker>(host_context_.storage.get());
     host_context_.metadata_tracker =
@@ -104,7 +109,6 @@ class ProtoTraceReaderTest : public ::testing::Test {
  protected:
   protozero::HeapBuffered<protos::pbzero::Trace> trace_;
   TraceProcessorContext host_context_;
-  std::unique_ptr<ClockSynchronizer> primary_sync_;
   std::unique_ptr<ProtoTraceReader> proto_trace_reader_;
 };
 
@@ -142,9 +146,53 @@ TEST_F(ProtoTraceReaderTest, RemoteClockSync_Valid) {
   clock->set_timestamp(135000);
 
   ASSERT_TRUE(Tokenize().ok());
-  ASSERT_EQ(1u,
-            machine_context->clock_tracker->remote_clock_offsets_for_testing()
-                .size());
+  // The cross-machine edge maps the remote BOOTTIME into the host frame.
+  EXPECT_EQ(*machine_context->clock_tracker->ToTraceTime(
+                ClockId::Machine(BOOTTIME), 0),
+            102500);
+}
+
+TEST_F(ProtoTraceReaderTest, RemoteClockSync_PerMachineOffsets) {
+  // Two distinct remote machines must keep independent clock offsets. Offsets
+  // used to live in the (global) TraceTimeState keyed only by clock id, so the
+  // second machine's BOOTTIME offset clobbered the first; they now live on each
+  // machine's ClockTracker.
+  auto* machine_a = host_context_.ForkContextForMachineInCurrentTrace(0x1001);
+  auto* machine_b = host_context_.ForkContextForMachineInCurrentTrace(0x1002);
+
+  // Adds a remote_clock_sync for |machine_id| with two BOOTTIME round trips.
+  // |client_base| shifts the client clock so the two machines resolve to
+  // different host offsets.
+  auto add_sync = [&](uint32_t machine_id, uint64_t client_base) {
+    auto* packet = trace_->add_packet();
+    packet->set_machine_id(machine_id);
+    auto* sync = packet->set_remote_clock_sync();
+    auto add_round = [&](uint64_t client_ts, uint64_t host_ts) {
+      auto* synced = sync->add_synced_clocks();
+      auto* c = synced->set_client_clocks()->add_clocks();
+      c->set_clock_id(BOOTTIME);
+      c->set_timestamp(client_ts);
+      auto* h = synced->set_host_clocks()->add_clocks();
+      h->set_clock_id(BOOTTIME);
+      h->set_timestamp(host_ts);
+    };
+    add_round(client_base, 120000);
+    add_round(client_base + 15000, 135000);
+  };
+  add_sync(0x1001, 10000);
+  add_sync(0x1002, 50000);
+
+  ASSERT_TRUE(Tokenize().ok());
+
+  // Each remote machine gets its own cross-machine edge, so its BOOTTIME maps
+  // into the host frame with its own offset (these used to clobber each other
+  // when offsets lived in shared global state).
+  auto a = machine_a->clock_tracker->ToTraceTime(ClockId::Machine(BOOTTIME), 0);
+  auto b = machine_b->clock_tracker->ToTraceTime(ClockId::Machine(BOOTTIME), 0);
+  ASSERT_TRUE(a.has_value() && b.has_value());
+  EXPECT_EQ(*a, 102500);
+  EXPECT_EQ(*b, 62500);
+  EXPECT_NE(*a, *b);
 }
 
 TEST_F(ProtoTraceReaderTest, RemoteClockSync_Incomplete) {
@@ -179,10 +227,11 @@ TEST_F(ProtoTraceReaderTest, RemoteClockSync_Incomplete) {
   // requirement for using the remote_clock_sync for calculating clock offset.
 
   ASSERT_TRUE(Tokenize().ok());
-  // No valid clock offset.
-  ASSERT_EQ(0u,
-            machine_context->clock_tracker->remote_clock_offsets_for_testing()
-                .size());
+  // Incomplete sync yields no cross-machine edge, so the remote falls back to
+  // the assume-aligned identity and its BOOTTIME maps through unchanged.
+  EXPECT_EQ(*machine_context->clock_tracker->ToTraceTime(
+                ClockId::Machine(BOOTTIME), 5000),
+            5000);
 }
 
 TEST_F(ProtoTraceReaderTest, CalculateClockOffset) {
@@ -281,7 +330,10 @@ TEST_F(ProtoTraceReaderTest, DeferredClockSnapshotSequenceScopedClock) {
   ASSERT_TRUE(proto_trace_reader_->OnPushDataToSorter().ok());
 
   // The deferred packet should have resolved without recording an error.
-  EXPECT_EQ(0, host_context_.storage->GetStats(
+  // clock_sync_failure_unknown_source_clock is kMachineAndTrace scope, so
+  // read it via the per-context stats_tracker which forwards the fixture's
+  // (machine_id, trace_id).
+  EXPECT_EQ(0, host_context_.stats_tracker->GetStats(
                    stats::clock_sync_failure_unknown_source_clock));
 }
 

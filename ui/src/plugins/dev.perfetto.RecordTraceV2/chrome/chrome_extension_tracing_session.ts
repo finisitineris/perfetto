@@ -16,13 +16,14 @@ import protos from '../../../protos';
 import {EvtSource} from '../../../base/events';
 import {ResizableArrayBuffer} from '../../../base/resizable_array_buffer';
 import {binaryDecode} from '../../../base/string_utils';
-import {
+import type {
   TracingSession,
   TracingSessionLogEntry,
   TracingSessionState,
 } from '../interfaces/tracing_session';
-import {ChromeExtensionTarget} from './chrome_extension_target';
-import {defer, Deferred} from '../../../base/deferred';
+import type {ChromeExtensionTarget} from './chrome_extension_target';
+import {defer, type Deferred} from '../../../base/deferred';
+import {errResult, type Result} from '../../../base/result';
 
 export class ChromeExtensionTracingSession implements TracingSession {
   private _state: TracingSessionState = 'RECORDING';
@@ -63,9 +64,9 @@ export class ChromeExtensionTracingSession implements TracingSession {
     return promise;
   }
 
-  getTraceData(): Uint8Array | undefined {
+  getTraceData(): ArrayBuffer | undefined {
     if (this._state !== 'FINISHED') return undefined;
-    const buf = this.traceBuf.get();
+    const buf = this.traceBuf.getBuffer();
     return buf;
   }
 
@@ -130,6 +131,10 @@ export class ChromeExtensionTracingSession implements TracingSession {
 
   get state(): TracingSessionState {
     return this._state;
+  }
+
+  async snapshot(): Promise<Result<Uint8Array>> {
+    return errResult('snapshot() is not supported for chrome tracing sessions');
   }
 
   private setState(newState: TracingSessionState) {

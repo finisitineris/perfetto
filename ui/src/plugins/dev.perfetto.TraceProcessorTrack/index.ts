@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import m from 'mithril';
 import {removeFalsyValues} from '../../base/array_utils';
 import {AsyncLimiter} from '../../base/async_limiter';
 import {assertExists} from '../../base/assert';
@@ -20,15 +21,17 @@ import {
   createAggregationTab,
   createIITable,
 } from '../../components/aggregation_adapter';
+import {sliceDistributionCellRenderers} from '../../components/details/slice_details';
+import {openDistributionTab} from '../../components/distribution_panel';
 import {
   metricsFromTableOrSubquery,
-  QueryFlamegraph,
-  QueryFlamegraphWithMetrics,
+  type QueryFlamegraphMetric,
 } from '../../components/query_flamegraph';
-import {MinimapRow} from '../../public/minimap';
-import {PerfettoPlugin} from '../../public/plugin';
-import {AreaSelection, areaSelectionsEqual} from '../../public/selection';
-import {Trace} from '../../public/trace';
+import {FlamegraphPanel} from '../../components/flamegraph_panel';
+import type {MinimapRow} from '../../public/minimap';
+import type {PerfettoPlugin} from '../../public/plugin';
+import {type AreaSelection, areaSelectionsEqual} from '../../public/selection';
+import type {Trace} from '../../public/trace';
 import {COUNTER_TRACK_KIND, SLICE_TRACK_KIND} from '../../public/track_kinds';
 import {getTrackName} from '../../public/utils';
 import {TrackNode} from '../../public/workspace';
@@ -52,8 +55,8 @@ import {SliceSelectionAggregator} from './slice_selection_aggregator';
 import {SLICE_TRACK_SCHEMAS} from './slice_tracks';
 import {TraceProcessorCounterTrack} from './trace_processor_counter_track';
 import {createTraceProcessorSliceTrack} from './trace_processor_slice_track';
-import {TopLevelTrackGroup, TrackGroupSchema} from './types';
-import {Store} from '../../base/store';
+import type {TopLevelTrackGroup, TrackGroupSchema} from './types';
+import type {Store} from '../../base/store';
 import {z} from 'zod';
 import {
   createPerfettoIndex,
@@ -258,28 +261,50 @@ export default class TraceProcessorTrackPlugin implements PerfettoPlugin {
       name: '__tracks_to_create',
       engine: ctx.engine,
       as: `
-        with grouped as materialized (
+        with
+        -- A thread's 'thread_overlapping_slice' overflow tracks share the type
+        -- and group_key of its 'thread_execution' track, so they combine into a
+        -- single track.
+        tracks as (
           select
-            t.type,
-            min(t.name) as name,
-            lower(min(t.name)) as lower_name,
+            t.id,
+            t.name,
             extract_arg(t.dimension_arg_set_id, 'utid') as utid,
             extract_arg(t.dimension_arg_set_id, 'upid') as upid,
             extract_arg(t.dimension_arg_set_id, 'gpu') as gpu_id,
             extract_arg(t.source_arg_set_id, 'description') as description,
+            iif(t.type = 'thread_overlapping_slice', 'thread_execution', t.type)
+              as type,
+            iif(
+              t.type in ('thread_execution', 'thread_overlapping_slice'),
+              'thread_' || extract_arg(t.dimension_arg_set_id, 'utid'),
+              iif(t.track_group_id is null,
+                  'track_' || t.id,
+                  'group_' || t.track_group_id)) as group_key
+          from _slice_track_summary s
+          join track t using (id)
+        ),
+        grouped as materialized (
+          select
+            t.type,
+            min(t.name) as name,
+            lower(min(t.name)) as lower_name,
+            t.utid,
+            t.upid,
+            t.gpu_id,
+            t.description,
             min(t.id) minTrackId,
             group_concat(t.id) as trackIds,
             count() as trackCount,
-            max(cs.track_id IS NOT NULL) as hasCallstacks,
-            CASE t.type
-              WHEN 'thread_execution' THEN 0
-              WHEN 'art_method_tracing' THEN 1
-              ELSE 99
-            END as track_rank
-          from _slice_track_summary s
-          join track t using (id)
+            max(cs.track_id is not null) as hasCallstacks,
+            case t.type
+              when 'thread_execution' then 0
+              when 'art_method_tracing' then 1
+              else 99
+            end as track_rank
+          from tracks t
           left join _track_event_tracks_with_callstacks cs on cs.track_id = t.id
-          group by type, upid, utid, gpu_id, t.track_group_id, ifnull(t.track_group_id, t.id)
+          group by t.type, t.upid, t.utid, t.gpu_id, t.group_key
         )
         select
           s.type,
@@ -528,7 +553,12 @@ export default class TraceProcessorTrackPlugin implements PerfettoPlugin {
 
   private createSliceFlameGraphPanel(trace: Trace) {
     let previousSelection: AreaSelection | undefined;
-    let flamegraphWithMetrics: QueryFlamegraphWithMetrics | undefined;
+    let computed:
+      | {
+          metrics: ReadonlyArray<QueryFlamegraphMetric>;
+          dependencies: ReadonlyArray<AsyncDisposable>;
+        }
+      | undefined;
     let isLoading = false;
     const limiter = new AsyncLimiter();
 
@@ -542,40 +572,31 @@ export default class TraceProcessorTrackPlugin implements PerfettoPlugin {
         previousSelection = selection;
         if (selectionChanged) {
           limiter.schedule(async () => {
-            // If we had a previous flamegraph, dispose of it now that the new
-            // one is ready.
-            if (flamegraphWithMetrics) {
-              await flamegraphWithMetrics.flamegraph[Symbol.asyncDispose]();
-            }
-
-            // Unset the flamegraph but set the isLoading flag so we render the
-            // right thing.
-            flamegraphWithMetrics = undefined;
+            computed = undefined;
             isLoading = true;
-
-            // Compute the new flamegraph
-            flamegraphWithMetrics = await this.computeSliceFlamegraph(
-              trace,
-              selection,
-            );
+            computed = await this.computeSliceFlamegraph(trace, selection);
             isLoading = false;
           });
         }
-        if (flamegraphWithMetrics === undefined && !isLoading) {
+        if (computed === undefined && !isLoading) {
           return undefined;
         }
         const store = assertExists(this.store);
         return {
-          isLoading: isLoading,
-          content: flamegraphWithMetrics?.flamegraph?.render({
-            metrics: flamegraphWithMetrics.metrics,
-            state: store.state.areaSelectionFlamegraphState,
-            onStateChange: (state) => {
-              store.edit((draft) => {
-                draft.areaSelectionFlamegraphState = state;
-              });
-            },
-          }),
+          isLoading,
+          content:
+            computed &&
+            m(FlamegraphPanel, {
+              trace,
+              metrics: computed.metrics,
+              dependencies: computed.dependencies,
+              state: store.state.areaSelectionFlamegraphState,
+              onStateChange: (state) => {
+                store.edit((draft) => {
+                  draft.areaSelectionFlamegraphState = state;
+                });
+              },
+            }),
         };
       },
     };
@@ -584,7 +605,13 @@ export default class TraceProcessorTrackPlugin implements PerfettoPlugin {
   private async computeSliceFlamegraph(
     trace: Trace,
     currentSelection: AreaSelection,
-  ): Promise<QueryFlamegraphWithMetrics | undefined> {
+  ): Promise<
+    | {
+        metrics: ReadonlyArray<QueryFlamegraphMetric>;
+        dependencies: ReadonlyArray<AsyncDisposable>;
+      }
+    | undefined
+  > {
     const trackIds = [];
     for (const trackInfo of currentSelection.tracks) {
       if (!trackInfo?.tags?.kinds?.includes(SLICE_TRACK_KIND)) {
@@ -631,6 +658,17 @@ export default class TraceProcessorTrackPlugin implements PerfettoPlugin {
       on: `${iiTable.name}(parent_id)`,
     });
 
+    // Reuse the flamegraph's source dataset and add a time-window filter so
+    // "Find matching slices" reflects the same events the user is looking at.
+    const distributionDataset = new SourceDataset({
+      src: `
+        select * from (${dataset.query()})
+        where ts < ${currentSelection.end}
+          and ts + dur > ${currentSelection.start}
+      `,
+      schema: dataset.schema,
+    });
+
     const metrics = metricsFromTableOrSubquery({
       tableOrSubquery: `(
         select *
@@ -665,6 +703,24 @@ export default class TraceProcessorTrackPlugin implements PerfettoPlugin {
           isVisible: (_) => true,
         },
       ],
+      optionalActions: [
+        {
+          name: 'Find matching slices',
+          execute: ({node}) => {
+            if (node === undefined) return;
+            openDistributionTab(trace, {
+              title: `${node.name} (in selection)`,
+              dataset: distributionDataset,
+              filter: {col: 'name', eq: node.name},
+              valueColumn: 'dur',
+              idColumn: 'id',
+              sqlTable: 'slice',
+              displayColumns: ['ts', 'dur'],
+              cellRenderers: sliceDistributionCellRenderers(trace),
+            });
+          },
+        },
+      ],
       nameColumnLabel: 'Slice Name',
     });
     const store = assertExists(this.store);
@@ -674,7 +730,7 @@ export default class TraceProcessorTrackPlugin implements PerfettoPlugin {
         metrics,
       );
     });
-    return {flamegraph: new QueryFlamegraph(trace, [iiTable]), metrics};
+    return {metrics, dependencies: [iiTable]};
   }
 
   private addMinimapContentProvider(ctx: Trace) {

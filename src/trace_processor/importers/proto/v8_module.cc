@@ -26,6 +26,7 @@
 #include "protos/perfetto/trace/trace_packet.pbzero.h"
 #include "src/trace_processor/importers/common/parser_types.h"
 #include "src/trace_processor/importers/common/process_tracker.h"
+#include "src/trace_processor/importers/common/stats_tracker.h"
 #include "src/trace_processor/importers/proto/packet_sequence_state_generation.h"
 #include "src/trace_processor/importers/proto/proto_importer_module.h"
 #include "src/trace_processor/importers/proto/v8_sequence_state.h"
@@ -63,34 +64,31 @@ V8Module::V8Module(ProtoImporterModuleContext* module_context,
 
 V8Module::~V8Module() = default;
 
-ModuleResult V8Module::TokenizePacket(
-    const TracePacket::Decoder&,
-    TraceBlobView* /*packet*/,
-    int64_t /*packet_timestamp*/,
-    RefPtr<PacketSequenceStateGeneration> /*state*/,
-    uint32_t /*field_id*/) {
+ModuleResult V8Module::TokenizePacket(const TokenizePacketArgs& /*args*/) {
   return ModuleResult::Ignored();
 }
 
-void V8Module::ParseTracePacketData(const TracePacket::Decoder& decoder,
-                                    int64_t ts,
-                                    const TracePacketData& data,
-                                    uint32_t field_id) {
-  switch (field_id) {
+void V8Module::ParseField(const ParseFieldArgs& args) {
+  switch (args.field.id()) {
     case TracePacket::kV8JsCodeFieldNumber:
-      ParseV8JsCode(decoder.v8_js_code(), ts, data);
+      ParseV8JsCode(args.field.Cast<TracePacket::kV8JsCode>(), args.ts,
+                    args.data);
       break;
     case TracePacket::kV8InternalCodeFieldNumber:
-      ParseV8InternalCode(decoder.v8_internal_code(), ts, data);
+      ParseV8InternalCode(args.field.Cast<TracePacket::kV8InternalCode>(),
+                          args.ts, args.data);
       break;
     case TracePacket::kV8WasmCodeFieldNumber:
-      ParseV8WasmCode(decoder.v8_wasm_code(), ts, data);
+      ParseV8WasmCode(args.field.Cast<TracePacket::kV8WasmCode>(), args.ts,
+                      args.data);
       break;
     case TracePacket::kV8RegExpCodeFieldNumber:
-      ParseV8RegExpCode(decoder.v8_reg_exp_code(), ts, data);
+      ParseV8RegExpCode(args.field.Cast<TracePacket::kV8RegExpCode>(), args.ts,
+                        args.data);
       break;
     case TracePacket::kV8CodeMoveFieldNumber:
-      ParseV8CodeMove(decoder.v8_code_move(), ts, data);
+      ParseV8CodeMove(args.field.Cast<TracePacket::kV8CodeMove>(), args.ts,
+                      args.data);
       break;
     default:
       break;
@@ -105,12 +103,11 @@ std::optional<UniqueTid> V8Module::GetUtid(
   auto* pid = isolate_to_pid_.Find(isolate_id);
   if (!pid) {
     tables::ProcessTable::Id upid(
-        context_->storage->v8_isolate_table().FindById(isolate_id)->upid());
+        context_->storage->v8_isolate_table()[isolate_id].upid());
     pid = isolate_to_pid_
-              .Insert(
-                  isolate_id,
-                  static_cast<uint32_t>(
-                      context_->storage->process_table().FindById(upid)->pid()))
+              .Insert(isolate_id,
+                      static_cast<uint32_t>(
+                          context_->storage->process_table()[upid].pid()))
               .first;
   }
 
@@ -129,18 +126,18 @@ std::optional<uint32_t> V8Module::GetDefaultTid(
     PacketSequenceStateGeneration& generation) const {
   auto* tp_defaults = generation.GetTracePacketDefaults();
   if (!tp_defaults) {
-    context_->storage->IncrementStats(stats::v8_no_defaults);
+    context_->stats_tracker->IncrementStats(stats::v8_no_defaults);
     return std::nullopt;
   }
   if (!tp_defaults->has_v8_code_defaults()) {
-    context_->storage->IncrementStats(stats::v8_no_defaults);
+    context_->stats_tracker->IncrementStats(stats::v8_no_defaults);
     return std::nullopt;
   }
 
   V8CodeDefaults::Decoder v8_defaults(tp_defaults->v8_code_defaults());
 
   if (!v8_defaults.has_tid()) {
-    context_->storage->IncrementStats(stats::v8_no_defaults);
+    context_->stats_tracker->IncrementStats(stats::v8_no_defaults);
     return std::nullopt;
   }
 

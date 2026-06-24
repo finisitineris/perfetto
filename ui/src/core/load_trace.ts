@@ -13,14 +13,14 @@
 // limitations under the License.
 
 import {assertExists, assertTrue} from '../base/assert';
-import {time, Time, TimeSpan} from '../base/time';
+import {type time, Time, TimeSpan} from '../base/time';
 import {cacheTrace} from './cache_manager';
 import {
   getEnabledMetatracingCategories,
   isMetatracingEnabled,
 } from './metatracing';
 import {featureFlags} from './feature_flags';
-import {Engine, EngineBase} from '../trace_processor/engine';
+import type {Engine, EngineBase} from '../trace_processor/engine';
 import {HttpRpcEngine} from '../trace_processor/http_rpc_engine';
 import {
   LONG,
@@ -36,17 +36,17 @@ import {
   TraceHttpStream,
   TraceMultipleFilesStream,
 } from '../core/trace_stream';
-import {TraceStream} from '../public/stream';
+import type {TraceStream} from '../public/stream';
 import {
   deserializeAppStatePhase1,
   deserializeAppStatePhase2,
 } from './state_serialization';
-import {AppImpl} from './app_impl';
+import type {AppImpl} from './app_impl';
 import {raf} from './raf_scheduler';
 import {TraceImpl} from './trace_impl';
-import {TraceSource} from './trace_source';
+import type {TraceSource} from './trace_source';
 import {Router} from '../core/router';
-import {TraceInfoImpl} from './trace_info_impl';
+import type {TraceInfoImpl} from './trace_info_impl';
 import {base64Decode} from '../base/string_utils';
 import {
   parseUrlCommands,
@@ -254,7 +254,6 @@ async function loadTraceIntoEngine(
   trace.timeline.setVisibleWindow(newViewport);
 
   const cacheUuid = traceDetails.cached ? traceDetails.uuid : '';
-  Router.navigate(`#!/viewer?local_cache_key=${cacheUuid}`);
 
   // Make sure the helper views are available before we start adding tracks.
   await includeSummaryTables(trace);
@@ -268,6 +267,11 @@ async function loadTraceIntoEngine(
   await app.plugins.onTraceLoad(trace, (id) => {
     updateStatus(app, `Running plugin: ${id}`);
   });
+
+  // Plugins may call trace.initialPage.suggest(...) during onTraceLoad to
+  // request that the app navigate somewhere other than /viewer.
+  const initialRoute = trace.initialPage.getWinner() ?? '/viewer';
+  Router.navigate(`#!${initialRoute}?local_cache_key=${cacheUuid}`);
 
   decideTabs(trace);
 
@@ -674,25 +678,32 @@ async function getTraceErrors(engine: Engine): Promise<number> {
 }
 
 async function getTracingMetadataTimeBounds(engine: Engine): Promise<TimeSpan> {
-  const queryRes = await engine.query(`select
-       name,
-       int_value as intValue
-       from metadata
-       where name = 'tracing_started_ns' or name = 'tracing_disabled_ns'
-       or name = 'all_data_source_started_ns'`);
-  let startBound = Time.MIN;
-  let endBound = Time.MAX;
-  const it = queryRes.iter({name: STR, intValue: LONG_NULL});
-  for (; it.valid(); it.next()) {
-    const columnName = it.name;
-    const timestamp = it.intValue;
-    if (timestamp === null) continue;
-    if (columnName === 'tracing_disabled_ns') {
-      endBound = Time.min(endBound, Time.fromRaw(timestamp));
-    } else {
-      startBound = Time.max(startBound, Time.fromRaw(timestamp));
-    }
-  }
-
+  // The tracing window metadata is recorded per (machine, trace):
+  // tracing_started_ns / all_data_source_started_ns mark when that trace's
+  // tracing became fully active, tracing_disabled_ns when it stopped. Compute
+  // each trace's active window (start = the later of its start timestamps, end =
+  // its disabled timestamp) and take the union across all of them. This way a
+  // multi-machine session or several traces loaded together yields a window
+  // spanning all of them, instead of the intersection of the per-trace windows
+  // (which is empty when those windows are disjoint).
+  const queryRes = await engine.query(`
+    select
+      min(start_ns) as startBound,
+      max(end_ns) as endBound
+    from (
+      select
+        max(iif(
+          name in ('tracing_started_ns', 'all_data_source_started_ns'),
+          int_value, null)) as start_ns,
+        max(iif(name = 'tracing_disabled_ns', int_value, null)) as end_ns
+      from metadata
+      where name in (
+        'tracing_started_ns', 'all_data_source_started_ns', 'tracing_disabled_ns')
+      group by machine_id, trace_id
+    )`);
+  const it = queryRes.iter({startBound: LONG_NULL, endBound: LONG_NULL});
+  const startBound =
+    it.startBound === null ? Time.MIN : Time.fromRaw(it.startBound);
+  const endBound = it.endBound === null ? Time.MAX : Time.fromRaw(it.endBound);
   return new TimeSpan(startBound, endBound);
 }

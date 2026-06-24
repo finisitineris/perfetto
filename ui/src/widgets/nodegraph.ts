@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import './nodegraph.scss';
 /**
  * A component for displaying and interacting with a node-based graph.
  *
@@ -1517,6 +1518,9 @@ export function NodeGraph(): m.Component<NodeGraphAttrs> {
         x: mouseX - canvasX * newZoom,
         y: mouseY - canvasY * newZoom,
       };
+    } else if (e.shiftKey) {
+      // Emulate horizontal scroll while shift held
+      panBy(-e.deltaY, 0);
     } else {
       // Pan the canvas based on wheel delta
       panBy(-e.deltaX, -e.deltaY);

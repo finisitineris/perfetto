@@ -37,6 +37,7 @@ class MachineTracker {
                       StringId release,
                       StringId version,
                       StringId arch);
+  void SetMachineName(StringId name);
   void SetNumCpus(uint32_t cpus);
   void SetAndroidBuildFingerprint(StringId build_fingerprint);
   void SetAndroidDeviceManufacturer(StringId device_manufacturer);
@@ -46,7 +47,7 @@ class MachineTracker {
   MachineId machine_id() const { return machine_id_; }
 
  private:
-  std::optional<tables::MachineTable::RowReference> getRow();
+  tables::MachineTable::RowReference getRow();
 
   MachineId machine_id_;
   TraceProcessorContext* const context_;

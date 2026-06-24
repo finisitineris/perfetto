@@ -40,6 +40,7 @@ SELECT
               'missed_sf_frames', missed_sf_frames,
               'missed_frames_max_successive', missed_frames_max_successive,
               -- convert from jank per second to total janks.
+              'weighted_missed_frames', weighted_missed_frames * anim_duration_ms / 1000,
               'weighted_missed_app_frames', weighted_missed_app_frames * anim_duration_ms / 1000,
               'weighted_missed_sf_frames', weighted_missed_sf_frames * anim_duration_ms / 1000,
               'sf_callback_missed_frames', sf_callback_missed_frames,
@@ -55,6 +56,7 @@ SELECT
               'missed_frames', SUM(app_missed OR sf_missed),
               'missed_app_frames', SUM(app_missed),
               'missed_sf_frames', SUM(sf_missed),
+              'weighted_missed_frames', SUM((app_missed OR sf_missed) * jank_score),
               'weighted_missed_app_frames', SUM(app_missed * jank_score),
               'weighted_missed_sf_frames', SUM(sf_missed * jank_score),
               'sf_callback_missed_frames', SUM(sf_callback_missed),
@@ -77,6 +79,7 @@ SELECT
               'missed_frames', SUM(app_missed OR sf_missed),
               'missed_app_frames', SUM(app_missed),
               'missed_sf_frames', SUM(sf_missed),
+              'weighted_missed_frames', SUM((app_missed OR sf_missed) * jank_score),
               'weighted_missed_app_frames', SUM(app_missed * jank_score),
               'weighted_missed_sf_frames', SUM(sf_missed * jank_score),
               'sf_callback_missed_frames', SUM(sf_callback_missed),
@@ -125,5 +128,5 @@ SELECT
         ))
       FROM android_jank_cuj cuj
       LEFT JOIN android_jank_cuj_boundary boundary USING (cuj_id)
-      LEFT JOIN android_jank_cuj_layer_name cuj_layer USING (cuj_id)
+      LEFT JOIN _android_jank_cuj_layer_name cuj_layer USING (cuj_id)
       ORDER BY cuj.cuj_id ASC));

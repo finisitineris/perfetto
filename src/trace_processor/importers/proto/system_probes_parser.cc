@@ -25,6 +25,7 @@
 #include <variant>
 #include <vector>
 
+#include "perfetto/base/flat_set.h"
 #include "perfetto/base/logging.h"
 #include "perfetto/ext/base/string_utils.h"
 #include "perfetto/ext/base/string_view.h"
@@ -43,6 +44,7 @@
 #include "src/trace_processor/importers/common/machine_tracker.h"
 #include "src/trace_processor/importers/common/metadata_tracker.h"
 #include "src/trace_processor/importers/common/process_tracker.h"
+#include "src/trace_processor/importers/common/stats_tracker.h"
 #include "src/trace_processor/importers/common/system_info_tracker.h"
 #include "src/trace_processor/importers/common/track_tracker.h"
 #include "src/trace_processor/importers/common/tracks.h"
@@ -64,6 +66,7 @@
 #include "protos/perfetto/trace/sys_stats/sys_stats.pbzero.h"
 #include "protos/perfetto/trace/system_info/cpu_info.pbzero.h"
 #include "protos/perfetto/trace/system_info/gpu_info.pbzero.h"
+#include "protos/perfetto/trace/system_info/interrupt_info.pbzero.h"
 
 namespace perfetto::trace_processor {
 
@@ -245,6 +248,16 @@ const char* GetSmapsKey(uint32_t field_id) {
   }
 }
 
+base::StringView MaybeTruncateKworkerName(base::StringView comm) {
+  if (comm.StartsWith("kworker/")) {
+    size_t delim_loc = std::min(comm.find('+', 8), comm.find('-', 8));
+    if (delim_loc != base::StringView::npos) {
+      return comm.substr(0, delim_loc);
+    }
+  }
+  return comm;
+}
+
 }  // namespace
 
 SystemProbesParser::SystemProbesParser(TraceProcessorContext* context)
@@ -364,7 +377,7 @@ void SystemProbesParser::ParseSysStats(int64_t ts, ConstBytes blob) {
     auto key = static_cast<size_t>(mi.key());
     if (PERFETTO_UNLIKELY(key >= meminfo_strs_.size())) {
       PERFETTO_ELOG("MemInfo key %zu is not recognized.", key);
-      context_->storage->IncrementStats(stats::meminfo_unknown_keys);
+      context_->stats_tracker->IncrementStats(stats::meminfo_unknown_keys);
       continue;
     }
     // /proc/meminfo counters are in kB, convert to bytes
@@ -402,7 +415,7 @@ void SystemProbesParser::ParseSysStats(int64_t ts, ConstBytes blob) {
     auto key = static_cast<size_t>(vm.key());
     if (PERFETTO_UNLIKELY(key >= vmstat_strs_.size())) {
       PERFETTO_ELOG("VmStat key %zu is not recognized.", key);
-      context_->storage->IncrementStats(stats::vmstat_unknown_keys);
+      context_->stats_tracker->IncrementStats(stats::vmstat_unknown_keys);
       continue;
     }
     TrackId track = context_->track_tracker->InternTrack(
@@ -415,7 +428,7 @@ void SystemProbesParser::ParseSysStats(int64_t ts, ConstBytes blob) {
     protos::pbzero::SysStats::CpuTimes::Decoder ct(*it);
     if (PERFETTO_UNLIKELY(!ct.has_cpu_id())) {
       PERFETTO_ELOG("CPU field not found in CpuTimes");
-      context_->storage->IncrementStats(stats::invalid_cpu_times);
+      context_->stats_tracker->IncrementStats(stats::invalid_cpu_times);
       continue;
     }
 
@@ -550,7 +563,7 @@ void SystemProbesParser::ParseSysStats(int64_t ts, ConstBytes blob) {
     auto resource = static_cast<size_t>(psi.resource());
     const char* resource_key = GetPsiResourceKey(resource);
     if (!resource_key) {
-      context_->storage->IncrementStats(stats::psi_unknown_resource);
+      context_->stats_tracker->IncrementStats(stats::psi_unknown_resource);
       return;
     }
     static constexpr auto kBlueprint = tracks::CounterBlueprint(
@@ -657,6 +670,7 @@ void SystemProbesParser::ParseSlabInfo(int64_t ts, ConstBytes blob) {
 void SystemProbesParser::ParseProcessTree(int64_t ts, ConstBytes blob) {
   protos::pbzero::ProcessTree::Decoder ps(blob);
 
+  base::FlatSet<uint32_t> kthread_pids;
   for (auto it = ps.processes(); it; ++it) {
     protos::pbzero::ProcessTree::Process::Decoder proc(*it);
     if (!proc.has_cmdline())
@@ -693,10 +707,11 @@ void SystemProbesParser::ParseProcessTree(int64_t ts, ConstBytes blob) {
     //
     // https://github.com/torvalds/linux/blob/6d280f4d760e3bcb4a8df302afebf085b65ec982/kernel/workqueue.c#L5336
     uint32_t kThreaddPid = 2;
-    if (ppid == kThreaddPid && argv0.StartsWith("kworker/")) {
-      size_t delim_loc = std::min(argv0.find('+', 8), argv0.find('-', 8));
-      if (delim_loc != base::StringView::npos) {
-        argv0 = argv0.substr(0, delim_loc);
+    if (ppid == kThreaddPid) {
+      kthread_pids.insert(pid);
+      base::StringView truncated = MaybeTruncateKworkerName(argv0);
+      if (truncated.size() != argv0.size()) {
+        argv0 = truncated;
         joined_cmdline = argv0;
       }
     }
@@ -769,6 +784,10 @@ void SystemProbesParser::ParseProcessTree(int64_t ts, ConstBytes blob) {
     }
   }
 
+  // perfetto v58+: the procfs scraper now writes an explicit Thread message for
+  // a process' main thread. All versions of perfetto before that make the main
+  // thread implicit (described only by the process message). The importer
+  // should stay compatible with both new and old traces.
   for (auto it = ps.threads(); it; ++it) {
     protos::pbzero::ProcessTree::Thread::Decoder thd(*it);
     auto tid = static_cast<uint32_t>(thd.tid());
@@ -776,7 +795,11 @@ void SystemProbesParser::ParseProcessTree(int64_t ts, ConstBytes blob) {
     context_->process_tracker->UpdateThread(tid, tgid);
 
     if (thd.has_name()) {
-      StringId thread_name_id = context_->storage->InternString(thd.name());
+      base::StringView thread_name = thd.name();
+      // Remove transient suffix from kworker names (as above).
+      if (tid == tgid && kthread_pids.count(tid))
+        thread_name = MaybeTruncateKworkerName(thread_name);
+      StringId thread_name_id = context_->storage->InternString(thread_name);
       auto utid = context_->process_tracker->GetOrCreateThread(tid);
       context_->process_tracker->UpdateThreadName(
           utid, thread_name_id, ThreadNamePriority::kProcessTree);
@@ -888,7 +911,8 @@ void SystemProbesParser::ParseProcessStats(int64_t ts, ConstBytes blob) {
       }
 
       // No handling for this field, so increment the error counter.
-      context_->storage->IncrementStats(stats::proc_stat_unknown_counters);
+      context_->stats_tracker->IncrementStats(
+          stats::proc_stat_unknown_counters);
     }
   }
 }
@@ -921,6 +945,12 @@ void SystemProbesParser::ParseSystemInfo(ConstBytes blob) {
   MachineTracker* machine_tracker = context_->machine_tracker.get();
   SystemInfoTracker* system_info_tracker =
       SystemInfoTracker::GetOrCreate(context_);
+
+  if (packet.has_machine_name()) {
+    machine_tracker->SetMachineName(
+        context_->storage->InternString(packet.machine_name()));
+  }
+
   if (packet.has_utsname()) {
     ConstBytes utsname_blob = packet.utsname();
     protos::pbzero::Utsname::Decoder utsname(utsname_blob);
@@ -1229,6 +1259,22 @@ void SystemProbesParser::ParseGpuInfo(ConstBytes blob) {
         inserter.AddArg(key_id, Variadic::String(val_id));
       }
     }
+  }
+}
+
+void SystemProbesParser::ParseInterruptInfo(ConstBytes blob) {
+  protos::pbzero::InterruptInfo::Decoder packet(blob);
+  for (auto it = packet.irq_mapping(); it; ++it) {
+    protos::pbzero::InterruptInfo::InterruptMapping::Decoder mapping(*it);
+    if (!mapping.has_irq_id() || !mapping.has_name())
+      continue;
+    if (!irq_ids_.Insert(mapping.irq_id(), true).second)
+      continue;
+    tables::InterruptMappingTable::Row row;
+    row.irq_id = mapping.irq_id();
+    row.name = context_->storage->InternString(mapping.name());
+    row.machine_id = context_->machine_tracker->machine_id();
+    context_->storage->mutable_interrupt_mapping_table()->Insert(row);
   }
 }
 

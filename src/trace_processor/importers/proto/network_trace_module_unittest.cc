@@ -26,19 +26,21 @@
 #include "perfetto/trace_processor/trace_blob.h"
 #include "perfetto/trace_processor/trace_blob_view.h"
 #include "protos/perfetto/common/builtin_clock.pbzero.h"
-#include "protos/perfetto/trace/android/network_trace.pbzero.h"
 #include "protos/perfetto/trace/trace.pbzero.h"
+#include "protos/third_party/android/connectivity/network_trace.pbzero.h"
 #include "src/trace_processor/core/dataframe/specs.h"
 #include "src/trace_processor/importers/common/args_translation_table.h"
 #include "src/trace_processor/importers/common/clock_tracker.h"
 #include "src/trace_processor/importers/common/global_args_tracker.h"
 #include "src/trace_processor/importers/common/global_metadata_tracker.h"
+#include "src/trace_processor/importers/common/global_stats_tracker.h"
 #include "src/trace_processor/importers/common/import_logs_tracker.h"
 #include "src/trace_processor/importers/common/machine_tracker.h"
 #include "src/trace_processor/importers/common/metadata_tracker.h"
 #include "src/trace_processor/importers/common/process_track_translation_table.h"
 #include "src/trace_processor/importers/common/slice_tracker.h"
 #include "src/trace_processor/importers/common/slice_translation_table.h"
+#include "src/trace_processor/importers/common/stats_tracker.h"
 #include "src/trace_processor/importers/common/track_compressor.h"
 #include "src/trace_processor/importers/common/track_tracker.h"
 #include "src/trace_processor/importers/proto/additional_modules.h"
@@ -60,13 +62,16 @@
 namespace perfetto::trace_processor {
 namespace {
 
-using ::perfetto::protos::pbzero::TrafficDirection;
+using ::android::net::connectivity::tracing::pbzero::ConnectivityTracePacket;
+using ::android::net::connectivity::tracing::pbzero::TrafficDirection;
 
 class NetworkTraceModuleTest : public testing::Test {
  public:
   NetworkTraceModuleTest() {
     context_.register_additional_proto_modules = &RegisterAdditionalModules;
     context_.storage = std::make_unique<TraceStorage>();
+    context_.global_stats_tracker =
+        std::make_unique<GlobalStatsTracker>(context_.storage.get());
     storage_ = context_.storage.get();
     context_.machine_tracker =
         std::make_unique<MachineTracker>(&context_, kDefaultMachineId);
@@ -75,6 +80,7 @@ class NetworkTraceModuleTest : public testing::Test {
     context_.trace_state =
         TraceProcessorContextPtr<TraceProcessorContext::TraceState>::MakeRoot(
             TraceProcessorContext::TraceState{TraceId(0)});
+    context_.stats_tracker = std::make_unique<StatsTracker>(&context_);
     context_.metadata_tracker = std::make_unique<MetadataTracker>(&context_);
     context_.import_logs_tracker =
         std::make_unique<ImportLogsTracker>(&context_, TraceId(1));
@@ -84,8 +90,7 @@ class NetworkTraceModuleTest : public testing::Test {
         context_.trace_time_state.get(),
         std::make_unique<ClockSynchronizerListenerImpl>(&context_));
     context_.clock_tracker = std::make_unique<ClockTracker>(
-        &context_, std::make_unique<ClockSynchronizerListenerImpl>(&context_),
-        primary_sync_.get(), true);
+        &context_, primary_sync_.get(), /*is_primary=*/true);
     context_.track_tracker = std::make_unique<TrackTracker>(&context_);
     context_.slice_tracker = std::make_unique<SliceTracker>(&context_);
     context_.global_args_tracker =
@@ -155,7 +160,8 @@ TEST_F(NetworkTraceModuleTest, ParseAndFormatPacket) {
   auto* packet = trace_->add_packet();
   packet->set_timestamp(123);
 
-  auto* event = packet->set_network_packet();
+  auto* event =
+      static_cast<ConnectivityTracePacket*>(packet)->set_network_packet();
   event->set_direction(TrafficDirection::DIR_EGRESS);
   event->set_length(72);
   event->set_uid(1010);
@@ -199,7 +205,8 @@ TEST_F(NetworkTraceModuleTest, TokenizeAndParsePerPacketBundle) {
   lengths.Append(72);
   lengths.Append(100);
 
-  auto* event = packet->set_network_packet_bundle();
+  auto* event = static_cast<ConnectivityTracePacket*>(packet)
+                    ->set_network_packet_bundle();
   event->set_packet_timestamps(timestamps);
   event->set_packet_lengths(lengths);
 
@@ -226,7 +233,8 @@ TEST_F(NetworkTraceModuleTest, TokenizeAndParseAggregateBundle) {
   auto* packet = trace_->add_packet();
   packet->set_timestamp(123);
 
-  auto* event = packet->set_network_packet_bundle();
+  auto* event = static_cast<ConnectivityTracePacket*>(packet)
+                    ->set_network_packet_bundle();
   event->set_total_packets(2);
   event->set_total_duration(10);
   event->set_total_length(172);

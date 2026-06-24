@@ -30,6 +30,7 @@
 #include "src/trace_processor/importers/common/mapping_tracker.h"
 #include "src/trace_processor/importers/common/process_tracker.h"
 #include "src/trace_processor/importers/common/stack_profile_tracker.h"
+#include "src/trace_processor/importers/common/stats_tracker.h"
 #include "src/trace_processor/importers/common/virtual_memory_mapping.h"
 #include "src/trace_processor/importers/proto/packet_sequence_state_generation.h"
 #include "src/trace_processor/importers/proto/profile_packet_utils.h"
@@ -42,11 +43,6 @@
 namespace perfetto {
 namespace trace_processor {
 namespace {
-base::StringView ToStringView(protozero::ConstBytes bytes) {
-  return base::StringView(reinterpret_cast<const char*>(bytes.data),
-                          bytes.size);
-}
-
 // Determine wether this is the magical kernel mapping created in
 // `perfetto::::profiling::Unwinder::SymbolizeKernelCallchain`
 bool IsMagicalKernelMapping(const CreateMappingParams& params) {
@@ -89,7 +85,8 @@ VirtualMemoryMapping* StackProfileSequenceState::FindOrInsertMappingImpl(
       protos::pbzero::InternedData::kMappingsFieldNumber,
       protos::pbzero::Mapping>(iid);
   if (!decoder) {
-    context_->storage->IncrementStats(stats::stackprofile_invalid_mapping_id);
+    context_->stats_tracker->IncrementStats(
+        stats::stackprofile_invalid_mapping_id);
     return nullptr;
   }
 
@@ -151,30 +148,28 @@ StackProfileSequenceState::LookupInternedBuildId(
   if (iid == 0) {
     return "";
   }
-  auto* decoder = state->LookupInternedMessage<
-      protos::pbzero::InternedData::kBuildIdsFieldNumber,
-      protos::pbzero::InternedString>(iid);
-  if (!decoder) {
-    context_->storage->IncrementStats(stats::stackprofile_invalid_string_id);
+  std::optional<base::StringView> str = state->InternedStringView(
+      protos::pbzero::InternedData::kBuildIdsFieldNumber, iid);
+  if (!str) {
+    context_->stats_tracker->IncrementStats(
+        stats::stackprofile_invalid_string_id);
     return std::nullopt;
   }
-
-  return ToStringView(decoder->str());
+  return *str;
 }
 
 std::optional<base::StringView>
 StackProfileSequenceState::LookupInternedMappingPath(
     PacketSequenceStateGeneration* state,
     uint64_t iid) {
-  auto* decoder = state->LookupInternedMessage<
-      protos::pbzero::InternedData::kMappingPathsFieldNumber,
-      protos::pbzero::InternedString>(iid);
-  if (!decoder) {
-    context_->storage->IncrementStats(stats::stackprofile_invalid_string_id);
+  std::optional<base::StringView> str = state->InternedStringView(
+      protos::pbzero::InternedData::kMappingPathsFieldNumber, iid);
+  if (!str) {
+    context_->stats_tracker->IncrementStats(
+        stats::stackprofile_invalid_string_id);
     return std::nullopt;
   }
-
-  return ToStringView(decoder->str());
+  return *str;
 }
 
 std::optional<CallsiteId> StackProfileSequenceState::FindOrInsertCallstack(
@@ -188,7 +183,8 @@ std::optional<CallsiteId> StackProfileSequenceState::FindOrInsertCallstack(
       protos::pbzero::InternedData::kCallstacksFieldNumber,
       protos::pbzero::Callstack>(iid);
   if (!decoder) {
-    context_->storage->IncrementStats(stats::stackprofile_invalid_callstack_id);
+    context_->stats_tracker->IncrementStats(
+        stats::stackprofile_invalid_callstack_id);
     return std::nullopt;
   }
 
@@ -205,7 +201,8 @@ std::optional<CallsiteId> StackProfileSequenceState::FindOrInsertCallstack(
   }
 
   if (!parent_callsite_id) {
-    context_->storage->IncrementStats(stats::stackprofile_empty_callstack);
+    context_->stats_tracker->IncrementStats(
+        stats::stackprofile_empty_callstack);
     return std::nullopt;
   }
 
@@ -225,7 +222,8 @@ std::optional<FrameId> StackProfileSequenceState::FindOrInsertFrame(
       protos::pbzero::InternedData::kFramesFieldNumber, protos::pbzero::Frame>(
       iid);
   if (!decoder) {
-    context_->storage->IncrementStats(stats::stackprofile_invalid_frame_id);
+    context_->stats_tracker->IncrementStats(
+        stats::stackprofile_invalid_frame_id);
     return std::nullopt;
   }
 
@@ -297,15 +295,14 @@ StackProfileSequenceState::LookupInternedFunctionName(
   if (iid == 0) {
     return "";
   }
-  auto* decoder = state->LookupInternedMessage<
-      protos::pbzero::InternedData::kFunctionNamesFieldNumber,
-      protos::pbzero::InternedString>(iid);
-  if (!decoder) {
-    context_->storage->IncrementStats(stats::stackprofile_invalid_string_id);
+  std::optional<base::StringView> str = state->InternedStringView(
+      protos::pbzero::InternedData::kFunctionNamesFieldNumber, iid);
+  if (!str) {
+    context_->stats_tracker->IncrementStats(
+        stats::stackprofile_invalid_string_id);
     return std::nullopt;
   }
-
-  return ToStringView(decoder->str());
+  return *str;
 }
 
 std::optional<base::StringView>
@@ -315,15 +312,14 @@ StackProfileSequenceState::LookupInternedSourcePath(
   if (iid == 0) {
     return std::nullopt;
   }
-  auto* decoder = state->LookupInternedMessage<
-      protos::pbzero::InternedData::kSourcePathsFieldNumber,
-      protos::pbzero::InternedString>(iid);
-  if (!decoder) {
-    context_->storage->IncrementStats(stats::stackprofile_invalid_string_id);
+  std::optional<base::StringView> str = state->InternedStringView(
+      protos::pbzero::InternedData::kSourcePathsFieldNumber, iid);
+  if (!str) {
+    context_->stats_tracker->IncrementStats(
+        stats::stackprofile_invalid_string_id);
     return std::nullopt;
   }
-
-  return ToStringView(decoder->str());
+  return *str;
 }
 
 }  // namespace trace_processor

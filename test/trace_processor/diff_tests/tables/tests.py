@@ -392,6 +392,90 @@ class Tables(TestSuite):
           "trace_uuid","00000000-0000-0000-0000-000000000001","[NULL]",0
         """))
 
+  # The `stats` vtable surfaces machine_id and trace_id columns so that the
+  # same stat (e.g. an ftrace data-loss counter) can be reported per
+  # (machine, trace) context in multi-machine sessions.
+  def test_stats_schema_machine_id_trace_id(self):
+    return DiffTestBlueprint(
+        trace=TextProto(r"""
+        packet {
+          ftrace_events {
+            cpu: 0
+            event {
+              timestamp: 1000
+              pid: 100
+              print { buf: "host" }
+            }
+          }
+          ftrace_stats {
+            phase: START_OF_TRACE
+            cpu_stats {
+              cpu: 0
+              entries: 7
+            }
+          }
+          trusted_packet_sequence_id: 1
+        }
+        packet {
+          ftrace_events {
+            cpu: 0
+            event {
+              timestamp: 2000
+              pid: 200
+              print { buf: "remote" }
+            }
+          }
+          ftrace_stats {
+            phase: START_OF_TRACE
+            cpu_stats {
+              cpu: 0
+              entries: 11
+            }
+          }
+          machine_id: 1001
+          trusted_packet_sequence_id: 2
+        }
+        """),
+        query=r"""
+          SELECT name, idx, value, machine_id, trace_id
+          FROM stats
+          WHERE name = 'ftrace_cpu_entries_begin'
+          ORDER BY machine_id, trace_id, idx;
+        """,
+        out=Csv(r"""
+          "name","idx","value","machine_id","trace_id"
+          "ftrace_cpu_entries_begin",0,7,0,0
+          "ftrace_cpu_entries_begin",0,11,1,0
+        """))
+
+  # kGlobal-scoped stats (e.g. parse timing counters) appear with NULL
+  # machine_id and trace_id, regardless of how many machines/traces the
+  # session contains.
+  def test_stats_global_scope_has_null_ids(self):
+    return DiffTestBlueprint(
+        trace=TextProto(r"""
+        packet {
+          ftrace_events {
+            cpu: 0
+            event {
+              timestamp: 1000
+              pid: 100
+              print { buf: "host" }
+            }
+          }
+          trusted_packet_sequence_id: 1
+        }
+        """),
+        query=r"""
+          SELECT name, machine_id, trace_id
+          FROM stats
+          WHERE name = 'parse_trace_duration_ns';
+        """,
+        out=Csv(r"""
+          "name","machine_id","trace_id"
+          "parse_trace_duration_ns","[NULL]","[NULL]"
+        """))
+
   def test_metadata_helpers(self):
     return DiffTestBlueprint(
         trace=TextProto(r"""
@@ -690,9 +774,9 @@ class Tables(TestSuite):
         SELECT * FROM machine
         """,
         out=Csv("""
-        "id","raw_id","sysname","release","version","arch","num_cpus","android_build_fingerprint","android_device_manufacturer","android_sdk_version","system_ram_bytes","system_ram_gb"
-        0,0,"Darwin","22.6.0","Foobar","x86_64",4,"[NULL]","[NULL]","[NULL]",126598774784,127
-        1,2420838448,"Linux","6.6.82-android15-8-g1a7680db913a-ab13304129","#1 SMP PREEMPT Wed Apr  2 01:42:00 UTC 2025","x86_64",8,"android_test_fingerprint","Android",33,12008292352,12
+        "id","raw_id","name","sysname","release","version","arch","num_cpus","android_build_fingerprint","android_device_manufacturer","android_sdk_version","system_ram_bytes","system_ram_gb"
+        0,0,"[NULL]","Darwin","22.6.0","Foobar","x86_64",4,"[NULL]","[NULL]","[NULL]",126598774784,127
+        1,2420838448,"[NULL]","Linux","6.6.82-android15-8-g1a7680db913a-ab13304129","#1 SMP PREEMPT Wed Apr  2 01:42:00 UTC 2025","x86_64",8,"android_test_fingerprint","Android",33,12008292352,12
         """))
 
   # user list table

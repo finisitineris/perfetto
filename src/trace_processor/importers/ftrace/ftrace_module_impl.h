@@ -41,16 +41,11 @@ class FtraceModuleImpl : public FtraceModule {
   explicit FtraceModuleImpl(ProtoImporterModuleContext* module_context,
                             TraceProcessorContext* context);
 
-  ModuleResult TokenizePacket(
-      const protos::pbzero::TracePacket::Decoder& decoder,
-      TraceBlobView* packet,
-      int64_t packet_timestamp,
-      RefPtr<PacketSequenceStateGeneration> state,
-      uint32_t field_id) override;
+  ModuleResult TokenizePacket(const TokenizePacketArgs& args) override;
 
   void ParseFtraceEventData(uint32_t cpu,
                             int64_t ts,
-                            const TracePacketData& data) override {
+                            const FtraceData& data) override {
     base::Status res = parser_.ParseFtraceEvent(cpu, ts, data);
     if (!res.ok()) {
       PERFETTO_ELOG("%s", res.message().c_str());

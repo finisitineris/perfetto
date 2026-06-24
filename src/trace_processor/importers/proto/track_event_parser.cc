@@ -35,6 +35,7 @@
 #include "src/trace_processor/importers/common/mapping_tracker.h"
 #include "src/trace_processor/importers/common/parser_types.h"
 #include "src/trace_processor/importers/common/process_tracker.h"
+#include "src/trace_processor/importers/common/stats_tracker.h"
 #include "src/trace_processor/importers/common/synthetic_tid.h"
 #include "src/trace_processor/importers/common/virtual_memory_mapping.h"
 #include "src/trace_processor/importers/proto/stack_profile_sequence_state.h"
@@ -53,6 +54,7 @@
 #include "protos/perfetto/trace/track_event/thread_descriptor.pbzero.h"
 #include "protos/perfetto/trace/track_event/track_descriptor.pbzero.h"
 #include "protos/perfetto/trace/track_event/track_event.pbzero.h"
+#include "protos/third_party/android/frameworks/base/proto/tracing/frameworks_base_interned_data.pbzero.h"
 #include "protos/third_party/chromium/chrome_enums.pbzero.h"
 
 namespace perfetto::trace_processor {
@@ -84,11 +86,12 @@ std::optional<base::Status> MaybeParseUnsymbolizedSourceLocation(
   if (!mapping) {
     return std::nullopt;
   }
-  delegate.AddUnsignedInteger(
-      util::ProtoToArgsParser::Key(prefix + ".mapping_id"),
-      mapping->mapping_id().value);
-  delegate.AddUnsignedInteger(util::ProtoToArgsParser::Key(prefix + ".rel_pc"),
-                              decoder->rel_pc());
+  auto mapping_key =
+      delegate.InternString(base::StringView(prefix + ".mapping_id"));
+  delegate.AddUnsignedInteger(mapping_key, mapping_key,
+                              mapping->mapping_id().value);
+  auto rel_pc_key = delegate.InternString(base::StringView(prefix + ".rel_pc"));
+  delegate.AddUnsignedInteger(rel_pc_key, rel_pc_key, decoder->rel_pc());
   return base::OkStatus();
 }
 
@@ -104,28 +107,38 @@ std::optional<base::Status> MaybeParseSourceLocation(
     return std::nullopt;
   }
 
-  delegate.AddString(util::ProtoToArgsParser::Key(prefix + ".file_name"),
+  auto file_name_key =
+      delegate.InternString(base::StringView(prefix + ".file_name"));
+  delegate.AddString(file_name_key, file_name_key,
                      NormalizePathSeparators(decoder->file_name()));
-  delegate.AddString(util::ProtoToArgsParser::Key(prefix + ".function_name"),
+  auto function_name_key =
+      delegate.InternString(base::StringView(prefix + ".function_name"));
+  delegate.AddString(function_name_key, function_name_key,
                      decoder->function_name());
   if (decoder->has_line_number()) {
-    delegate.AddInteger(util::ProtoToArgsParser::Key(prefix + ".line_number"),
+    auto line_number_key =
+        delegate.InternString(base::StringView(prefix + ".line_number"));
+    delegate.AddInteger(line_number_key, line_number_key,
                         decoder->line_number());
   }
   return base::OkStatus();
 }
 
 std::optional<base::Status> MaybeParseAndroidJobName(
+    StringId job_name_key,
     const protozero::Field& field,
     util::ProtoToArgsParser::Delegate& delegate) {
-  auto* decoder = delegate.GetInternedMessage(
-      protos::pbzero::InternedData::kAndroidJobName, field.as_uint64());
-  if (!decoder) {
+  std::optional<base::StringView> name =
+      delegate.seq_state()->InternedStringView(
+          com::android::internal::pbzero::FrameworksBaseInternedData::
+              kAndroidJobNameFieldNumber,
+          field.as_uint64());
+  if (!name) {
     return std::nullopt;
   }
 
-  delegate.AddString(util::ProtoToArgsParser::Key("job_scheduler_job.job_name"),
-                     decoder->name());
+  delegate.AddString(job_name_key, job_name_key,
+                     protozero::ConstChars{name->data(), name->size()});
   return base::OkStatus();
 }
 
@@ -133,7 +146,8 @@ std::optional<base::Status> MaybeParseAndroidJobName(
 
 TrackEventParser::TrackEventParser(TraceProcessorContext* context,
                                    TrackEventTracker* track_event_tracker)
-    : args_parser_(*context->descriptor_pool_),
+    : args_parser_(*context->descriptor_pool_,
+                   *context->storage->mutable_string_pool()),
       context_(context),
       track_event_tracker_(track_event_tracker),
       counter_name_thread_time_id_(
@@ -146,6 +160,8 @@ TrackEventParser::TrackEventParser(TraceProcessorContext* context,
           context->storage->InternString("task.posted_from.function_name")),
       task_line_number_args_key_id_(
           context->storage->InternString("task.posted_from.line_number")),
+      job_scheduler_job_name_args_key_id_(
+          context->storage->InternString("job_scheduler_job.job_name")),
       log_message_body_key_id_(
           context->storage->InternString("track_event.log_message.message")),
       log_message_source_location_function_name_key_id_(
@@ -276,9 +292,10 @@ TrackEventParser::TrackEventParser(TraceProcessorContext* context,
       });
   args_parser_.AddParsingOverrideForField(
       "job_scheduler_job.job_name_iid",
-      [](const protozero::Field& field,
-         util::ProtoToArgsParser::Delegate& delegate) {
-        return MaybeParseAndroidJobName(field, delegate);
+      [this](const protozero::Field& field,
+             util::ProtoToArgsParser::Delegate& delegate) {
+        return MaybeParseAndroidJobName(job_scheduler_job_name_args_key_id_,
+                                        field, delegate);
       });
 
   args_parser_.AddParsingOverrideForField(
@@ -304,7 +321,7 @@ void TrackEventParser::ParseTrackDescriptor(
   // process and/or thread (i.e. new upid/utid).
   auto track = track_event_tracker_->ResolveDescriptorTrack(decoder.uuid());
   if (!track) {
-    context_->storage->IncrementStats(stats::track_event_parser_errors);
+    context_->stats_tracker->IncrementStats(stats::track_event_parser_errors);
     return;
   }
 
@@ -450,7 +467,7 @@ void TrackEventParser::ParseTrackEvent(int64_t ts,
       range_of_interest_start_us && ts < *range_of_interest_start_us * 1000) {
     // The event is outside of the range of interest, and dropping is enabled.
     // So we drop the event.
-    context_->storage->IncrementStats(
+    context_->stats_tracker->IncrementStats(
         stats::track_event_dropped_packets_outside_of_range_of_interest);
     return;
   }
@@ -458,7 +475,7 @@ void TrackEventParser::ParseTrackEvent(int64_t ts,
       TrackEventEventImporter(this, ts, event_data, blob, packet_sequence_id)
           .Import();
   if (!status.ok()) {
-    context_->storage->IncrementStats(stats::track_event_parser_errors);
+    context_->stats_tracker->IncrementStats(stats::track_event_parser_errors);
     PERFETTO_DLOG("ParseTrackEvent error: %s", status.c_message());
   }
 }

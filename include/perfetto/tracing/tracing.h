@@ -32,6 +32,7 @@
 #include "perfetto/base/export.h"
 #include "perfetto/base/logging.h"
 #include "perfetto/tracing/backend_type.h"
+#include "perfetto/tracing/buffer_exhausted_policy.h"
 #include "perfetto/tracing/core/forward_decls.h"
 #include "perfetto/tracing/internal/in_process_tracing_backend.h"
 #include "perfetto/tracing/internal/system_tracing_backend.h"
@@ -74,6 +75,17 @@ using LogMessageCallback = ::perfetto::base::LogMessageCallback;
 struct TracingInitArgs {
   uint32_t backends = 0;                     // One or more BackendTypes.
   TracingBackend* custom_backend = nullptr;  // [Optional].
+
+  // [Optional] Machine id to attribute this process's trace data to. Only
+  // honored by the in-process backend; the system backend derives the machine
+  // id service-side and ignores this. Lets separate in-process traces be
+  // recorded under distinct machine ids. 0 means the default (host) machine.
+  //
+  // For a non-default (non-host) machine id, the tracing session's TraceConfig
+  // must opt into matching non-host machines (set trace_all_machines, or a
+  // machine_name_filter that matches); otherwise the data sources are filtered
+  // out and record no data.
+  uint32_t machine_id = 0;
 
   // [Optional] Platform implementation. It allows the embedder to take control
   // of platform-specific bits like thread creation and TLS slot handling. If
@@ -152,6 +164,12 @@ struct TracingInitArgs {
   // making sure that Trace Processor doesn't merge track event and system
   // event tracks for the same thread.
   bool disallow_merging_with_system_tracks = false;
+
+  // [Optional] Sets the default buffer exhausted policy for TrackEvent.
+  // Defaults to kDrop. When set to kStall, the calling thread will block
+  // when the shared memory buffer is full instead of dropping trace data.
+  BufferExhaustedPolicy track_event_buffer_exhausted_policy =
+      BufferExhaustedPolicy::kDrop;
 
   // If set, this function will be called by the producer client to create a
   // socket for connection to the system service. The function takes one

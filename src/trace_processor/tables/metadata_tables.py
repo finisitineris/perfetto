@@ -39,6 +39,11 @@ MACHINE_TABLE = Table(
     columns=[
         C('raw_id', CppUint32()),
         C(
+            'name',
+            CppOptional(CppString()),
+            cpp_access=CppAccess.READ_AND_LOW_PERF_WRITE,
+        ),
+        C(
             'sysname',
             CppOptional(CppString()),
             cpp_access=CppAccess.READ_AND_LOW_PERF_WRITE,
@@ -99,6 +104,13 @@ MACHINE_TABLE = Table(
                 '''
                   Raw machine identifier in the trace packet, non-zero for
                   remote machines.
+                ''',
+            'name':
+                '''
+                  Human-readable name of the machine (from
+                  SystemInfo.machine_name or a perfetto_manifest machine
+                  override), used as the machine's label in the UI. NULL when
+                  the machine did not advertise a name.
                 ''',
             'sysname':
                 '''
@@ -523,6 +535,26 @@ GPU_TABLE = Table(
                 '''Extra args associated with the GPU''',
         }))
 
+INTERRUPT_MAPPING_TABLE = Table(
+    python_module=__file__,
+    class_name='InterruptMappingTable',
+    sql_name='_linux_interrupt_mapping',
+    columns=[
+        C('irq_id', CppUint32()),
+        C('name', CppString()),
+        C('machine_id', CppTableId(MACHINE_TABLE)),
+    ],
+    tabledoc=TableDoc(
+        doc='''
+          Contains information for IRQ mappings seen during the trace.
+        ''',
+        group='Misc',
+        columns={
+            'irq_id': '''The IRQ ID.''',
+            'name': '''The name of the IRQ.''',
+            'machine_id': '''The machine that emitted the IRQ.''',
+        }))
+
 CHROME_RAW_TABLE = Table(
     python_module=__file__,
     class_name='ChromeRawTable',
@@ -743,6 +775,86 @@ TRACE_FILE_TABLE = Table(
                 '''In which order where the files were processed.''',
             'is_container':
                 '''Whether the file is a container (e.g. zip, gzip)''',
+        }))
+
+STATS_TABLE = Table(
+    python_module=__file__,
+    class_name='StatsTable',
+    sql_name='__intrinsic_stats',
+    columns=[
+        C(
+            'name',
+            CppString(),
+            cpp_access=CppAccess.READ,
+            cpp_access_duration=CppAccessDuration.POST_FINALIZATION,
+        ),
+        C(
+            'key',
+            CppInt64(),
+            cpp_access=CppAccess.READ,
+            cpp_access_duration=CppAccessDuration.POST_FINALIZATION,
+        ),
+        C(
+            'idx',
+            CppOptional(CppInt64()),
+            cpp_access=CppAccess.READ,
+            cpp_access_duration=CppAccessDuration.POST_FINALIZATION,
+        ),
+        C(
+            'severity',
+            CppString(),
+            cpp_access=CppAccess.READ,
+            cpp_access_duration=CppAccessDuration.POST_FINALIZATION,
+        ),
+        C(
+            'source',
+            CppString(),
+            cpp_access=CppAccess.READ,
+            cpp_access_duration=CppAccessDuration.POST_FINALIZATION,
+        ),
+        C(
+            'value',
+            CppInt64(),
+            sql_access=SqlAccess.HIGH_PERF,
+            cpp_access=CppAccess.READ_AND_HIGH_PERF_WRITE,
+            cpp_access_duration=CppAccessDuration.POST_FINALIZATION,
+        ),
+        C(
+            'description',
+            CppString(),
+            cpp_access=CppAccess.READ,
+            cpp_access_duration=CppAccessDuration.POST_FINALIZATION,
+        ),
+        C(
+            'machine_id',
+            CppOptional(CppTableId(MACHINE_TABLE)),
+            cpp_access=CppAccess.READ,
+            cpp_access_duration=CppAccessDuration.POST_FINALIZATION,
+        ),
+        C(
+            'trace_id',
+            CppOptional(CppTableId(TRACE_FILE_TABLE)),
+            cpp_access=CppAccess.READ,
+            cpp_access_duration=CppAccessDuration.POST_FINALIZATION,
+        ),
+    ],
+    tabledoc=TableDoc(
+        doc='''
+            Diagnostic stats and parser errors, one row per
+            (key, idx, machine_id, trace_id) combination. Written by
+            GlobalStatsTracker; exposed via the `stats` SQL view.
+        ''',
+        group='Misc',
+        columns={
+            'name': 'Stat name (e.g. ftrace_cpu_overrun_begin).',
+            'key': 'Numeric stat key (stats::KeyIDs enum value).',
+            'idx': 'Per-stat index for kIndexed stats; NULL for kSingle.',
+            'severity': '"info" | "data_loss" | "error".',
+            'source': '"trace" (recorded on-device) or "analysis" (TP).',
+            'value': 'Stat value.',
+            'description': 'Human-readable description.',
+            'machine_id': 'Machine that produced this stat (NULL for kGlobal).',
+            'trace_id': 'Trace that produced this stat (NULL for kGlobal).',
         }))
 
 METADATA_TABLE = Table(
@@ -984,9 +1096,11 @@ ALL_TABLES = [
     FILEDESCRIPTOR_TABLE,
     FTRACE_EVENT_TABLE,
     GPU_TABLE,
+    INTERRUPT_MAPPING_TABLE,
     TRACE_IMPORT_LOGS_TABLE,
     MACHINE_TABLE,
     METADATA_TABLE,
+    STATS_TABLE,
     MODULES_TABLE,
     PROCESS_TABLE,
     THREAD_TABLE,
