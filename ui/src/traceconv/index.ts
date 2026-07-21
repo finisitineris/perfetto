@@ -13,7 +13,7 @@
 // limitations under the License.
 
 import {addErrorHandler, type ErrorDetails, reportError} from '../base/logging';
-import {assertExists} from '../base/assert';
+import {ensureExists} from '../base/assert';
 import type {time} from '../base/time';
 import traceconv from '../gen/traceconv';
 
@@ -65,7 +65,7 @@ function forwardError(error: ErrorDetails) {
 }
 
 function fsNodeToBuffer(fsNode: traceconv.FileSystemNode): Uint8Array {
-  const fileSize = assertExists(fsNode.usedBytes);
+  const fileSize = ensureExists(fsNode.usedBytes);
   return new Uint8Array(fsNode.contents.buffer, 0, fileSize);
 }
 
@@ -79,7 +79,7 @@ async function runTraceconv(trace: Blob, args: string[]) {
   });
   module.FS.mkdir('/fs');
   module.FS.mount(
-    assertExists(module.FS.filesystems.WORKERFS),
+    ensureExists(module.FS.filesystems.WORKERFS),
     {blobs: [{name: 'trace.proto', data: trace}]},
     '/fs',
   );
@@ -170,9 +170,12 @@ async function ConvertTraceAndOpenInLegacy(
   }
 }
 
+type PprofProfileType = 'alloc' | 'perf' | 'java-heap';
+
 interface ConvertTraceToPprofArgs {
   kind: 'ConvertTraceToPprof';
   trace: Blob;
+  profileType: PprofProfileType;
   pid: number;
   ts: time;
 }
@@ -184,9 +187,15 @@ function isConvertTraceToPprof(msg: Args): msg is ConvertTraceToPprofArgs {
   return true;
 }
 
-async function ConvertTraceToPprof(trace: Blob, pid: number, ts: time) {
+async function ConvertTraceToPprof(
+  trace: Blob,
+  profileType: PprofProfileType,
+  pid: number,
+  ts: time,
+) {
   const args = [
     'profile',
+    `--${profileType}`,
     `--pid`,
     `${pid}`,
     `--timestamps`,
@@ -199,6 +208,12 @@ async function ConvertTraceToPprof(trace: Blob, pid: number, ts: time) {
     const heapDirName = Object.keys(
       module.FS.lookupPath('/tmp/').node.contents,
     )[0];
+    if (heapDirName === undefined) {
+      throw new Error(
+        'No profiles generated; the trace has no profile matching ' +
+          `type=${profileType} pid=${pid} ts=${ts}`,
+      );
+    }
     const heapDirContents = module.FS.lookupPath(`/tmp/${heapDirName}`).node
       .contents;
     const heapDumpFiles = Object.keys(heapDirContents);
@@ -225,7 +240,7 @@ selfWorker.onmessage = (msg: MessageEvent) => {
   } else if (isConvertTraceAndOpenInLegacy(args)) {
     ConvertTraceAndOpenInLegacy(args.trace, args.truncate);
   } else if (isConvertTraceToPprof(args)) {
-    ConvertTraceToPprof(args.trace, args.pid, args.ts);
+    ConvertTraceToPprof(args.trace, args.profileType, args.pid, args.ts);
   } else {
     throw new Error(`Unknown method call ${JSON.stringify(args)}`);
   }

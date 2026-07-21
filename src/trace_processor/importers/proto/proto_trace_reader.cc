@@ -41,9 +41,11 @@
 #include "perfetto/public/compiler.h"
 #include "perfetto/trace_processor/basic_types.h"
 #include "src/trace_processor/importers/common/args_tracker.h"
+#include "src/trace_processor/importers/common/builtin_trace_importers.h"
 #include "src/trace_processor/importers/common/clock_tracker.h"
 #include "src/trace_processor/importers/common/event_tracker.h"
 #include "src/trace_processor/importers/common/import_logs_tracker.h"
+#include "src/trace_processor/importers/common/machine_tracker.h"
 #include "src/trace_processor/importers/common/metadata_tracker.h"
 #include "src/trace_processor/importers/common/parser_types.h"
 #include "src/trace_processor/importers/common/process_tracker.h"
@@ -59,9 +61,11 @@
 #include "src/trace_processor/tables/metadata_tables_py.h"
 #include "src/trace_processor/types/trace_processor_context.h"
 #include "src/trace_processor/types/variadic.h"
+#include "src/trace_processor/util/decompressor.h"
 #include "src/trace_processor/util/descriptors.h"
-#include "src/trace_processor/util/gzip_utils.h"
+#include "src/trace_processor/util/trace_type.h"
 
+#include "perfetto/protozero/proto_utils.h"
 #include "protos/perfetto/common/builtin_clock.pbzero.h"
 #include "protos/perfetto/common/trace_attributes.pbzero.h"
 #include "protos/perfetto/common/trace_stats.pbzero.h"
@@ -205,6 +209,24 @@ ProtoTraceReader::ProtoTraceReader(TraceProcessorContext* ctx,
   if (context_->register_additional_proto_modules) {
     context_->register_additional_proto_modules(&module_context_, context_);
   }
+  // This needs to happen after the TrackEvent descriptors have been registered,
+  // which happens in one of the modules. (See
+  // https://github.com/google/perfetto/issues/6260)
+  for (const std::string& raw_bytes :
+       context_->config.extra_parsing_descriptors) {
+    auto status = context_->descriptor_pool_->AddFromFileDescriptorSet(
+        reinterpret_cast<const uint8_t*>(raw_bytes.data()), raw_bytes.size(),
+        {}, true);
+    if (!status.ok()) {
+      context_->import_logs_tracker->RecordAnalysisError(
+          stats::extra_parsing_descriptors_error,
+          [&](ArgsTracker::BoundInserter& ins) {
+            ins.AddArg(context_->storage->InternString("message"),
+                       Variadic::String(
+                           context_->storage->InternString(status.message())));
+          });
+    }
+  }
 }
 
 ProtoTraceReader::~ProtoTraceReader() = default;
@@ -221,21 +243,21 @@ base::Status ProtoTraceReader::ParseExtensionDescriptor(ConstBytes descriptor) {
 
   const uint8_t* data = nullptr;
   size_t size = 0;
-  std::vector<uint8_t> decompressed;
+  std::optional<util::DecompressedBuffer> decompressed;
   if (decoder.has_extension_set()) {
     auto extension = decoder.extension_set();
     data = extension.data;
     size = extension.size;
   } else if (decoder.has_extension_set_gzip()) {
     auto gzipped = decoder.extension_set_gzip();
-    decompressed =
-        util::GzipDecompressor::DecompressFully(gzipped.data, gzipped.size);
-    if (decompressed.empty()) {
+    decompressed = util::DecompressToBuffer(util::CompressionType::kGzip,
+                                            gzipped.data, gzipped.size);
+    if (!decompressed || decompressed->size == 0) {
       return base::ErrStatus(
-          "Failed to decompress gzipped extension descriptor");
+          "Failed to decompress gzipped extension descriptor (ERR:tp-corrupt)");
     }
-    data = decompressed.data();
-    size = decompressed.size();
+    data = decompressed->data.get();
+    size = decompressed->size;
   } else {
     return base::OkStatus();
   }
@@ -250,45 +272,38 @@ base::Status ProtoTraceReader::ParsePacket(TraceBlobView packet) {
   protos::pbzero::TracePacket::Decoder decoder(packet.data(), packet.length());
   if (PERFETTO_UNLIKELY(decoder.bytes_left())) {
     return base::ErrStatus(
-        "Failed to parse proto packet fully; the trace is probably corrupt.");
+        "Failed to parse proto packet fully; the trace is probably corrupt. "
+        "(ERR:tp-corrupt)");
   }
 
-  // Any compressed packets should have been handled by the tokenizer.
-  PERFETTO_CHECK(!decoder.has_compressed_packets());
+  // Compressed packets are expanded by the tokenizer; none should reach here.
+  PERFETTO_CHECK(!decoder.has_compressed_packets() &&
+                 !decoder.has_zstd_compressed_packets());
 
-  // When the trace packet is emitted from a remote machine: parse the packet
-  // using a different ProtoTraceReader instance. The packet will be parsed
-  // in the context of the remote machine.
-  if (PERFETTO_UNLIKELY(decoder.machine_id())) {
-    // A machine_id proves the trace is multi-machine, which a perfetto_manifest
-    // clock/machine override (single-machine by construction) cannot describe.
-    RETURN_IF_ERROR(CheckManifestSingleMachine());
-    if (is_machine_dispatcher_) {
-      auto [it, inserted] =
-          machine_to_proto_readers_.Insert(decoder.machine_id(), nullptr);
-      if (PERFETTO_UNLIKELY(inserted)) {
-        auto* machine_context =
-            context_->ForkContextForMachineInCurrentTrace(decoder.machine_id());
-        *it =
-            std::make_unique<ProtoTraceReader>(machine_context,
-                                               /*is_machine_dispatcher=*/false);
-        auto parent_default = context_->clock_tracker->trace_default_clock();
-        if (parent_default) {
-          machine_context->clock_tracker->SetTraceDefaultClock(*parent_default);
-        }
-        machine_context->clock_tracker->AddDeferredClockSync(
-            ClockId::Machine(protos::pbzero::BUILTIN_CLOCK_BOOTTIME));
-        // TODO(lalitm): this doesn't seem the right place for this but I cannot
-        // think of a much better place either.
-        machine_context->process_tracker->SetPidZeroIsUpidZeroIdleProcess();
+  // The top-level reader dispatches packets from other machines to a
+  // per-machine reader; host and adopted-machine packets are parsed here.
+  if (is_machine_dispatcher_) {
+    const uint32_t machine_id = decoder.machine_id();
+    if (PERFETTO_UNLIKELY(machine_id)) {
+      // Resolve adoption once, on the first remote-machine packet.
+      if (PERFETTO_UNLIKELY(!adopted_machine_id_.has_value())) {
+        RETURN_IF_ERROR(ResolveAdoptedMachine(machine_id));
       }
-      return it->get()->ParsePacket(std::move(packet));
+      // Route packets from a non-adopted machine to their own reader.
+      if (machine_id != *adopted_machine_id_) {
+        auto [reader, inserted] =
+            machine_to_proto_readers_.Insert(machine_id, nullptr);
+        if (PERFETTO_UNLIKELY(inserted)) {
+          RETURN_IF_ERROR(CreateRemoteMachineReader(machine_id, reader));
+        }
+        return reader->get()->ParsePacket(std::move(packet));
+      }
+    } else if (!host_machine_used_ && !decoder.has_synchronization_marker()) {
+      // The host owns this packet, so it can no longer be adopted away.
+      host_machine_used_ = true;
     }
   }
-  // Assert that the packet is parsed using the right instance of reader: the
-  // top-level dispatcher handles host packets (no machine_id), and the
-  // sub-readers it forks handle their own machine's packets (machine_id set).
-  PERFETTO_DCHECK(decoder.has_machine_id() == !is_machine_dispatcher_);
+  PERFETTO_DCHECK(is_machine_dispatcher_ || decoder.has_machine_id());
 
   // Execute ProtoVM logic right after the "machine ID fork" as detailed in
   // go/perfetto-proto-vm.
@@ -556,6 +571,10 @@ void ProtoTraceReader::ParseTraceConfig(protozero::ConstBytes blob) {
       }
     }
   }
+
+  if (trace_config.has_trace_attributes()) {
+    HandleTraceAttributes(trace_config.trace_attributes());
+  }
 }
 
 void ProtoTraceReader::HandleIncrementalStateCleared(
@@ -760,16 +779,90 @@ base::Status ProtoTraceReader::ParseClockSnapshot(ConstBytes blob,
   return base::OkStatus();
 }
 
+PERFETTO_NO_INLINE base::Status ProtoTraceReader::ResolveAdoptedMachine(
+    uint32_t machine_id) {
+  RETURN_IF_ERROR(CheckManifestSingleMachine());
+  // Adopt the embedded machine onto the host context (relabelling its row) only
+  // when the host has no data of its own, its row isn't already claimed by
+  // another machine, the file is not a multi-machine manifest, and the machine
+  // has no row/context yet. Otherwise route to the fork path, which reuses any
+  // existing row for this machine; adopting here would relabel a second row to
+  // the same raw id and surface a duplicate machine.
+  const bool host_has_data = host_machine_used_;
+  const bool host_row_claimed =
+      context_->machine_tracker->raw_machine_id() != 0;
+  const bool is_manifest_machine =
+      context_->trace_state && context_->trace_state->machine_remap;
+  const bool machine_already_materialized =
+      context_->forked_context_state->machine_to_context.Find(
+          static_cast<int64_t>(machine_id)) != nullptr;
+  if (host_has_data || host_row_claimed || is_manifest_machine ||
+      machine_already_materialized) {
+    adopted_machine_id_ = 0;
+    return base::OkStatus();
+  }
+  context_->machine_tracker->SetRawMachineId(machine_id);
+  // Register the adopted machine in the per-machine dedup map so a later fork
+  // for the same id (e.g. another co-located trace routed through
+  // CreateRemoteMachineReader) reuses this context and row instead of inserting
+  // a duplicate machine row.
+  context_->forked_context_state->machine_to_context.Insert(
+      static_cast<int64_t>(machine_id), context_);
+  adopted_machine_id_ = machine_id;
+  return base::OkStatus();
+}
+
+PERFETTO_NO_INLINE base::Status ProtoTraceReader::CreateRemoteMachineReader(
+    uint32_t machine_id,
+    std::unique_ptr<ProtoTraceReader>* out) {
+  // Embedded ids are uint32, always below kFirstManifestMachineId (1<<32), so
+  // they never collide with the manifest's synthetic raw ids; no check needed.
+  int64_t raw_machine_id = machine_id;
+  const auto* remap =
+      context_->trace_state ? context_->trace_state->machine_remap : nullptr;
+  if (remap) {
+    int64_t* mapped = remap->Find(machine_id);
+    if (!mapped) {
+      return base::ErrStatus(
+          "perfetto_manifest: machines: trace has a packet from undeclared "
+          "machine id %u",
+          machine_id);
+    }
+    raw_machine_id = *mapped;
+  }
+  auto* machine_context =
+      context_->ForkContextForMachineInCurrentTrace(raw_machine_id);
+  *out = std::make_unique<ProtoTraceReader>(machine_context,
+                                            /*is_machine_dispatcher=*/false);
+  auto parent_default = context_->clock_tracker->trace_default_clock();
+  if (parent_default) {
+    machine_context->clock_tracker->SetTraceDefaultClock(*parent_default);
+  }
+  machine_context->clock_tracker->AddDeferredClockSync(
+      ClockId::Machine(protos::pbzero::BUILTIN_CLOCK_BOOTTIME));
+  // TODO(lalitm): this doesn't seem the right place for this but I cannot think
+  // of a much better place either.
+  machine_context->process_tracker->SetPidZeroIsUpidZeroIdleProcess();
+  return base::OkStatus();
+}
+
 base::Status ProtoTraceReader::CheckManifestSingleMachine() {
   if (context_->has_machine_override()) {
     return base::ErrStatus(
-        "perfetto_manifest: machine override requires the trace to come "
-        "from a single machine");
+        "perfetto_manifest: a `machine` override attributes the file to one "
+        "machine, but the file contains packets from multiple machines. "
+        "Replace `machine` with a `machines` block that maps each embedded "
+        "machine_id to a named machine, e.g. "
+        R"("machines": [{"id": 0, "name": "phone"}, {"id": 7, "name": "vm"}].)");
   }
   if (context_->has_clock_override()) {
     return base::ErrStatus(
-        "perfetto_manifest: clock overrides require the trace to come "
-        "from a single machine");
+        "perfetto_manifest: a `clocks` override applies only to a "
+        "single-machine file, but the file contains packets from multiple "
+        "machines. Remove the `clocks` override and let the trace's own "
+        "remote clock snapshots align the machines; if you need to anchor a "
+        "specific embedded machine, split it into its own file and override "
+        "that.");
   }
   return base::OkStatus();
 }
@@ -817,16 +910,31 @@ base::Status ProtoTraceReader::ParseRemoteClockSync(ConstBytes blob) {
   }
 
   // Express each per-clock offset as a cross-machine edge in the single clock
-  // graph: at the synced instant the host clock reads 0 and this (client)
-  // machine's clock reads |offset|, so the two are linked directly.
+  // graph: at a synced instant the host clock reads |host_anchor| and this
+  // (client) machine's clock reads |host_anchor + offset|, so the two are
+  // linked directly. The anchor is a real host reading (the last sync round
+  // that observed this clock) rather than a literal 0: that keeps the snapshot
+  // rows we materialise to the clock_snapshot table at meaningful, in-bounds
+  // timestamps instead of converting the epoch (e.g. REALTIME 0) into a wildly
+  // negative trace time.
   uint32_t client_machine = context_->machine_id().value;
   uint32_t host_machine = context_->trace_time_state->clock_id.machine_id;
   auto clock_offsets = CalculateClockOffsets(sync_clock_snapshots);
   for (auto it = clock_offsets.GetIterator(); it; ++it) {
     uint32_t builtin = it.key().clock_id;
+    int64_t offset = it.value();
+
+    // CalculateClockOffsets only emits an offset for a clock that was observed
+    // on both sides, so at least one round carries a non-zero host reading.
+    int64_t host_anchor = 0;
+    for (const auto& round : sync_clock_snapshots) {
+      if (auto* clocks = round.Find(builtin); clocks && clocks->first)
+        host_anchor = static_cast<int64_t>(clocks->first);
+    }
+
     context_->clock_tracker->AddQualifiedSnapshot(
-        {{ClockId::Machine(host_machine, builtin), 0},
-         {ClockId::Machine(client_machine, builtin), it.value()}});
+        {{ClockId::Machine(host_machine, builtin), host_anchor},
+         {ClockId::Machine(client_machine, builtin), host_anchor + offset}});
   }
   return base::OkStatus();
 }
@@ -1080,34 +1188,6 @@ void ProtoTraceReader::ParseTraceStats(ConstBytes blob) {
     context_->stats_tracker->SetIndexedStats(
         stats::traced_buf_trace_writer_packet_loss, buf_num,
         static_cast<int64_t>(buf.trace_writer_packet_loss()));
-    if (buf.has_shadow_buffer_stats()) {
-      protos::pbzero::TraceStats::BufferStats::ShadowBufferStats::Decoder sbs(
-          buf.shadow_buffer_stats());
-      context_->stats_tracker->SetIndexedStats(
-          stats::traced_buf_v2s_packets_seen, buf_num,
-          static_cast<int64_t>(sbs.packets_seen()));
-      context_->stats_tracker->SetIndexedStats(
-          stats::traced_buf_v2s_packets_in_both, buf_num,
-          static_cast<int64_t>(sbs.packets_in_both()));
-      context_->stats_tracker->SetIndexedStats(
-          stats::traced_buf_v2s_packets_only_v1, buf_num,
-          static_cast<int64_t>(sbs.packets_only_v1()));
-      context_->stats_tracker->SetIndexedStats(
-          stats::traced_buf_v2s_packets_only_v2, buf_num,
-          static_cast<int64_t>(sbs.packets_only_v2()));
-      context_->stats_tracker->SetIndexedStats(
-          stats::traced_buf_v2s_patches_attempted, buf_num,
-          static_cast<int64_t>(sbs.patches_attempted()));
-      context_->stats_tracker->SetIndexedStats(
-          stats::traced_buf_v2s_v1_patches_succeeded, buf_num,
-          static_cast<int64_t>(sbs.v1_patches_succeeded()));
-      context_->stats_tracker->SetIndexedStats(
-          stats::traced_buf_v2s_v2_patches_succeeded, buf_num,
-          static_cast<int64_t>(sbs.v2_patches_succeeded()));
-      context_->stats_tracker->SetIndexedStats(
-          stats::traced_buf_v2s_stats_version, buf_num,
-          static_cast<uint32_t>(sbs.stats_version()));
-    }
   }
 
   struct BufStats {
@@ -1183,6 +1263,12 @@ base::Status ProtoTraceReader::OnPushDataToSorter() {
   for (auto& packet : eof_deferred_packets_) {
     RETURN_IF_ERROR(TimestampTokenizeAndPushToSorter(std::move(packet)));
   }
+  // Remote-machine readers are only ever reached by the dispatcher, never by
+  // the ForwardingTraceParser, so their own clock-deferred packets would
+  // otherwise never be flushed. Propagate EOF to them too.
+  for (auto it = machine_to_proto_readers_.GetIterator(); it; ++it) {
+    RETURN_IF_ERROR(it.value()->OnPushDataToSorter());
+  }
   return base::OkStatus();
 }
 
@@ -1216,6 +1302,119 @@ void ProtoTraceReader::OnEventsFullyExtracted() {
     context_->stats_tracker->IncrementStats(
         stats::config_write_into_file_no_flush);
   }
+}
+
+namespace {
+
+constexpr uint8_t kTracePacketTag =
+    protozero::proto_utils::MakeTagLengthDelimited(
+        protos::pbzero::Trace::kPacketFieldNumber);
+constexpr uint16_t kModuleSymbolsTag =
+    protozero::proto_utils::MakeTagLengthDelimited(
+        protos::pbzero::TracePacket::kModuleSymbolsFieldNumber);
+
+bool IsProtoTraceWithSymbols(const uint8_t* ptr, size_t size) {
+  const uint8_t* const end = ptr + size;
+
+  uint64_t tag;
+  const uint8_t* next = protozero::proto_utils::ParseVarInt(ptr, end, &tag);
+  if (next == ptr || tag != kTracePacketTag) {
+    return false;
+  }
+
+  ptr = next;
+  uint64_t field_length;
+  next = protozero::proto_utils::ParseVarInt(ptr, end, &field_length);
+  if (next == ptr) {
+    return false;
+  }
+  ptr = next;
+
+  if (field_length == 0) {
+    return false;
+  }
+
+  next = protozero::proto_utils::ParseVarInt(ptr, end, &tag);
+  if (next == ptr) {
+    return false;
+  }
+
+  return tag == kModuleSymbolsTag;
+}
+
+// Perfetto proto trace.
+class ProtoImporter : public TraceImporter<ProtoImporter> {
+ public:
+  ProtoImporter() : TraceImporter(MakeDescriptor()) {}
+  ~ProtoImporter() override;
+
+  bool Sniff(const uint8_t* data, size_t size) const override {
+    return size > 0 && data[0] == kTracePacketTag;
+  }
+
+  base::StatusOr<std::unique_ptr<ChunkedTraceReader>> CreateReader(
+      TraceProcessorContext* context,
+      uint32_t) const override {
+    return std::unique_ptr<ChunkedTraceReader>(
+        std::make_unique<ProtoTraceReader>(context));
+  }
+
+ private:
+  static TraceTypeDescriptor MakeDescriptor() {
+    TraceTypeDescriptor d;
+    d.name = "proto";
+    d.sort_policy = TraceSortPolicy::kConfigDriven;
+    d.clock_policy = TraceClockPolicy::kBoottime;
+    d.sets_default_clock = false;
+    d.claims_global_clock = false;
+    d.archive_priority = 0;
+    d.pid_zero_is_idle = true;
+    d.detection_priority = 230;
+    return d;
+  }
+};
+
+ProtoImporter::~ProtoImporter() = default;
+
+// Standalone module symbols proto (a proto trace whose first packet is
+// ModuleSymbols). Uses the same ProtoTraceReader.
+class SymbolsImporter : public TraceImporter<SymbolsImporter> {
+ public:
+  SymbolsImporter() : TraceImporter(MakeDescriptor()) {}
+  ~SymbolsImporter() override;
+
+  bool Sniff(const uint8_t* data, size_t size) const override {
+    return IsProtoTraceWithSymbols(data, size);
+  }
+
+  base::StatusOr<std::unique_ptr<ChunkedTraceReader>> CreateReader(
+      TraceProcessorContext* context,
+      uint32_t) const override {
+    return std::unique_ptr<ChunkedTraceReader>(
+        std::make_unique<ProtoTraceReader>(context));
+  }
+
+ private:
+  static TraceTypeDescriptor MakeDescriptor() {
+    TraceTypeDescriptor d;
+    d.name = "symbols";
+    d.sort_policy = TraceSortPolicy::kConfigDriven;
+    d.archive_priority = 3;
+    d.detection_priority = 210;
+    return d;
+  }
+};
+
+SymbolsImporter::~SymbolsImporter() = default;
+
+}  // namespace
+
+std::unique_ptr<TraceImporterBase> CreateProtoImporter() {
+  return std::make_unique<ProtoImporter>();
+}
+
+std::unique_ptr<TraceImporterBase> CreateSymbolsImporter() {
+  return std::make_unique<SymbolsImporter>();
 }
 
 }  // namespace perfetto::trace_processor

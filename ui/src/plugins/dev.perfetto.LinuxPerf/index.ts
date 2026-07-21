@@ -13,7 +13,7 @@
 // limitations under the License.
 
 import m from 'mithril';
-import {assertExists} from '../../base/assert';
+import {ensureExists} from '../../base/assert';
 import type {QueryFlamegraphMetric} from '../../components/query_flamegraph';
 import {FlamegraphPanel} from '../../components/flamegraph_panel';
 import type {PerfettoPlugin} from '../../public/plugin';
@@ -77,7 +77,7 @@ export default class LinuxPerfPlugin implements PerfettoPlugin {
     this.store = trace.mountStore(LinuxPerfPlugin.id, (init) =>
       this.migrateLinuxPerfPluginState(init),
     );
-    const store = assertExists(this.store);
+    const store = ensureExists(this.store);
     await this.cacheCounterTypesPerSession(trace);
     await this.addProcessPerfSamplesTracks(trace, store);
     await this.addThreadPerfSamplesTracks(trace, store);
@@ -94,6 +94,7 @@ export default class LinuxPerfPlugin implements PerfettoPlugin {
     const result = await trace.engine.query(`
       SELECT pct.perf_session_id, pct.name, MAX(pct.is_timebase) as is_timebase
       FROM perf_counter_track pct
+      JOIN _counter_track_summary s ON pct.id = s.id
       GROUP BY pct.perf_session_id, pct.name
       ORDER BY pct.perf_session_id, is_timebase DESC, pct.name
     `);
@@ -439,7 +440,7 @@ export default class LinuxPerfPlugin implements PerfettoPlugin {
         if (flamegraphMetrics === undefined) {
           return undefined;
         }
-        const store = assertExists(this.store);
+        const store = ensureExists(this.store);
         return {
           isLoading: false,
           content: m(FlamegraphPanel, {
@@ -563,7 +564,7 @@ export default class LinuxPerfPlugin implements PerfettoPlugin {
       aggregatableProperties,
     });
 
-    const store = assertExists(this.store);
+    const store = ensureExists(this.store);
     store.edit((draft) => {
       draft.areaSelectionFlamegraphState = Flamegraph.updateState(
         draft.areaSelectionFlamegraphState,
@@ -598,7 +599,7 @@ export default class LinuxPerfPlugin implements PerfettoPlugin {
 }
 
 async function selectPerfTracksIfSingleProcess(trace: Trace) {
-  const profile = await assertExists(trace.engine).query(`
+  const profile = await ensureExists(trace.engine).query(`
     select distinct upid
     from perf_sample
     join thread using (utid)
@@ -621,7 +622,7 @@ function getSelectedProcessTrackTags(currentSelection: AreaSelection) {
       trackInfo.tags?.utid === undefined
     ) {
       ret.push([
-        assertExists(trackInfo.tags?.upid),
+        ensureExists(trackInfo.tags?.upid),
         Number(trackInfo.tags.perfSessionId),
       ]);
     }

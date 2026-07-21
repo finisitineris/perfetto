@@ -36,12 +36,13 @@ import {
   METRIC_DOMINATED_OBJECT_SIZE,
   METRIC_OBJECT_SIZE,
 } from './views/flamegraph_view';
+import type {time} from '../../base/time';
 
 interface FlamegraphSelection {
   readonly pathHashes: string;
   readonly isDominator: boolean;
   readonly upid: number;
-  readonly ts: bigint;
+  readonly ts: time;
 }
 
 // A flamegraph drill-down tab: identity plus the title's object count (null
@@ -124,6 +125,7 @@ export class HeapDumpExplorerSession {
         s.flamegraphTabs = undefined;
         s.instanceTabs = undefined;
         s.flamegraphPanelState = undefined;
+        s.callstackPanelState = undefined;
       });
     }
     return restored;
@@ -147,6 +149,7 @@ export class HeapDumpExplorerSession {
       s.flamegraphTabs = undefined;
       s.instanceTabs = undefined;
       s.flamegraphPanelState = undefined;
+      s.callstackPanelState = undefined;
     });
     void this.loadOverview();
   }
@@ -359,6 +362,16 @@ export class HeapDumpExplorerSession {
     });
   };
 
+  get callstackPanelState(): FlamegraphState | undefined {
+    return this.store.state.callstackPanelState;
+  }
+
+  readonly setCallstackPanelState = (state: FlamegraphState): void => {
+    this.store.edit((s) => {
+      s.callstackPanelState = state;
+    });
+  };
+
   // Open the flamegraph pivoted at `pathHash`. The metric matches the tree the
   // hash came from. The chip shows `<label> (this instance)` since the raw hash
   // regex is unreadable.
@@ -374,7 +387,7 @@ export class HeapDumpExplorerSession {
       filters: [],
       view: {
         kind: 'PIVOT',
-        pivot: `^${pathHash}$`,
+        pivot: `/^${pathHash}$/`,
         displayLabel: `${label} (this instance)`,
       },
     });
@@ -393,7 +406,9 @@ export class HeapDumpExplorerSession {
     if (dump === null) return;
     try {
       const data = await queries.getOverview(this.engine, dump);
-      if (this.activeDump === dump) this._overview = data;
+      if (this.activeDump === dump) {
+        this._overview = data;
+      }
     } catch (err) {
       console.error('Failed to load overview:', err);
     } finally {

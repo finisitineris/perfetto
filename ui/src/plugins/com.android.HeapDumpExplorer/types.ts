@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import type {time} from '../../base/time';
+
 export interface HeapInfo {
   name: string;
   java: number;
@@ -41,6 +43,11 @@ export interface DuplicateArrayGroup {
   count: number;
   totalBytes: number;
   wastedBytes: number;
+}
+
+export interface OomeData {
+  upid: number;
+  ts: time;
 }
 
 export interface OverviewData {
@@ -132,20 +139,6 @@ export interface InstanceDetail {
   dominated: InstanceRow[];
   dominatorPath: PathEntry[] | null;
   shortestPath: PathEntry[] | null;
-}
-
-export interface ClassRow {
-  className: string;
-  count: number;
-  shallowSize: number;
-  nativeSize: number;
-  retainedSize: number;
-  retainedNativeSize: number;
-  retainedCount: number;
-  reachableSize: number | null;
-  reachableNativeSize: number | null;
-  reachableCount: number | null;
-  heap: string;
 }
 
 export interface BitmapListRow {

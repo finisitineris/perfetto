@@ -31,7 +31,7 @@ AND (
 -- account instant events and frame boundaries in the following tables.
 CREATE PERFETTO TABLE _jank_cujs_slices AS
 SELECT
-  row_number() OVER (ORDER BY ts) AS cuj_id,
+  row_number() OVER (ORDER BY ts, slice.id) AS cuj_id,
   process.upid AS upid,
   process.name AS process_name,
   slice.id AS slice_id,
@@ -269,7 +269,7 @@ WHERE
 --    per frame during the CUJ (`HAVING MAX(layers_per_frame) = 1`). If so, we safely
 --    use that layer's name (extracted via `MAX(layer_name)`). If multiple layers
 --    were rendered simultaneously, we can't safely guess, and return NULL.
-CREATE PERFETTO TABLE _android_jank_cuj_layer_name(
+CREATE PERFETTO TABLE android_jank_cuj_layer_name(
   -- CUJ id.
   cuj_id LONG,
   -- Layer name of the CUJ.

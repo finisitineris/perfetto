@@ -275,6 +275,54 @@ class Profiling(TestSuite):
         """,
         out=Path('perf_sample_rvc.out'))
 
+  def test_perf_sample_timebase_count(self):
+    return DiffTestBlueprint(
+        trace=TextProto(R"""
+        packet {
+          trusted_packet_sequence_id: 1
+          incremental_state_cleared: true
+          timestamp: 1000
+          trace_packet_defaults {
+            perf_sample_defaults {
+              timebase {
+                name: "leader"
+                counter: SW_CPU_CLOCK
+                frequency: 1000
+              }
+            }
+          }
+        }
+        packet {
+          trusted_packet_sequence_id: 1
+          timestamp: 3000
+          perf_sample {
+            cpu: 0
+            pid: 1
+            tid: 42
+            cpu_mode: MODE_USER
+            timebase_count: 512
+          }
+        }
+        packet {
+          trusted_packet_sequence_id: 1
+          timestamp: 4000
+          perf_sample {
+            cpu: 0
+            pid: 1
+            tid: 42
+            cpu_mode: MODE_USER
+            # Note: No timebase_count set!
+          }
+        }
+        """),
+        query="""
+        SELECT ts, value FROM counter;
+        """,
+        out=Csv("""
+        "ts","value"
+        3000,512.000000
+        """))
+
   def test_perf_sample_sc(self):
     return DiffTestBlueprint(
         trace=DataPath('perf_sample_sc.pb'),
@@ -594,6 +642,173 @@ class Profiling(TestSuite):
         0,0,2,1144537.000000
         """))
 
+  def test_stack_sample(self):
+    return DiffTestBlueprint(
+        trace=Path('stack_sample.textproto'),
+        query="""
+        SELECT
+          ss.ts,
+          ec.cpu,
+          ec.mode,
+          ss.weight,
+          tb.source,
+          tb.name AS timebase_name,
+          tb.unit,
+          spf.name AS frame_name
+        FROM __intrinsic_stack_sample ss
+        JOIN __intrinsic_stack_sample_counter tb ON ss.timebase_id = tb.id
+        LEFT JOIN __intrinsic_stack_sample_execution_context ec
+          ON ss.execution_context_id = ec.id
+        JOIN stack_profile_callsite spc ON ss.callsite_id = spc.id
+        JOIN stack_profile_frame spf ON spc.frame_id = spf.id
+        ORDER BY ss.ts;
+        """,
+        out=Csv("""
+        "ts","cpu","mode","weight","source","timebase_name","unit","frame_name"
+        1000,2,"user",1000000,"python.wall","wall-time","ns","foo"
+        2000,2,"kernel",2000000,"python.wall","wall-time","ns","foo"
+        6000,"[NULL]","[NULL]",4000000,"python.wall","wall-time","ns","foo"
+        7000,"[NULL]","[NULL]",7000000,"python.wall","wall-time","ns","foo"
+        """))
+
+  def test_stack_sample_contexts(self):
+    return DiffTestBlueprint(
+        trace=Path('stack_sample.textproto'),
+        query="""
+        -- The ts=1000 sample is attributed to a task and execution context; the
+        -- ts=7000 sample has neither, so both context ids are NULL.
+        SELECT
+          ss.ts,
+          p.name AS process_name,
+          ec.cpu,
+          ec.mode
+        FROM __intrinsic_stack_sample ss
+        LEFT JOIN __intrinsic_stack_sample_task_context tc
+          ON ss.task_context_id = tc.id
+        LEFT JOIN process p ON tc.upid = p.upid
+        LEFT JOIN __intrinsic_stack_sample_execution_context ec
+          ON ss.execution_context_id = ec.id
+        ORDER BY ss.ts;
+        """,
+        out=Csv("""
+        "ts","process_name","cpu","mode"
+        1000,"myproc",2,"user"
+        2000,"myproc",2,"kernel"
+        6000,"myproc","[NULL]","[NULL]"
+        7000,"[NULL]","[NULL]","[NULL]"
+        """))
+
+  def test_stack_sample_interned_callstack(self):
+    return DiffTestBlueprint(
+        trace=Path('stack_sample.textproto'),
+        query="""
+        -- The ts=2000 sample references its callstack via callstack_iid.
+        SELECT
+          ss.ts,
+          ss.weight,
+          spf.name AS frame_name
+        FROM __intrinsic_stack_sample ss
+        JOIN stack_profile_callsite spc ON ss.callsite_id = spc.id
+        JOIN stack_profile_frame spf ON spc.frame_id = spf.id
+        WHERE ss.ts = 2000;
+        """,
+        out=Csv("""
+        "ts","weight","frame_name"
+        2000,2000000,"foo"
+        """))
+
+  def test_stack_sample_inline_callstack(self):
+    return DiffTestBlueprint(
+        trace=Path('stack_sample.textproto'),
+        query="""
+        -- The ts=1000 sample carries a fully-inline callstack: its frames are
+        -- interned from function name + source location alone.
+        WITH RECURSIVE cs AS (
+          SELECT spc.id, spc.parent_id, spc.depth, spc.frame_id
+          FROM __intrinsic_stack_sample ss
+          JOIN stack_profile_callsite spc ON ss.callsite_id = spc.id
+          WHERE ss.ts = 1000
+          UNION ALL
+          SELECT p.id, p.parent_id, p.depth, p.frame_id
+          FROM stack_profile_callsite p
+          JOIN cs ON cs.parent_id = p.id
+        )
+        SELECT cs.depth, spf.name AS frame_name, sym.source_file,
+          sym.line_number
+        FROM cs
+        JOIN stack_profile_frame spf ON cs.frame_id = spf.id
+        LEFT JOIN stack_profile_symbol sym
+          ON spf.symbol_set_id = sym.symbol_set_id
+        ORDER BY cs.depth;
+        """,
+        out=Csv("""
+        "depth","frame_name","source_file","line_number"
+        0,"main","/src/main.py",10
+        1,"foo","/src/foo.py",42
+        """))
+
+  def test_stack_sample_async(self):
+    return DiffTestBlueprint(
+        trace=Path('stack_sample.textproto'),
+        query="""
+        -- The ts=6000 sample is attributed to an async context (async_id 7);
+        -- its descriptor name/kind fold onto the task context.
+        SELECT
+          ss.ts,
+          p.name AS process_name,
+          tc.async_name,
+          tc.async_kind
+        FROM __intrinsic_stack_sample ss
+        JOIN __intrinsic_stack_sample_task_context tc
+          ON ss.task_context_id = tc.id
+        LEFT JOIN process p ON tc.upid = p.upid
+        WHERE tc.async_name IS NOT NULL
+        ORDER BY ss.ts;
+        """,
+        out=Csv("""
+        "ts","process_name","async_name","async_kind"
+        6000,"myproc","worker-1","fiber"
+        """))
+
+  def test_stack_sample_followers(self):
+    return DiffTestBlueprint(
+        trace=Path('stack_sample.textproto'),
+        query="""
+        -- The ts=1000 sample has one follower ("instructions") with value 500;
+        -- the primary timebase and the follower share the counter table.
+        SELECT
+          ss.ts,
+          c.name AS counter_name,
+          c.unit,
+          f.weight
+        FROM __intrinsic_stack_sample ss
+        JOIN __intrinsic_stack_sample_follower f ON f.stack_sample_id = ss.id
+        JOIN __intrinsic_stack_sample_counter c ON f.counter_id = c.id
+        ORDER BY ss.ts, f.id;
+        """,
+        out=Csv("""
+        "ts","counter_name","unit","weight"
+        1000,"instructions","instructions",500
+        """))
+
+  def test_frame_types(self):
+    return DiffTestBlueprint(
+        trace=Path('frame_types.textproto'),
+        query="""
+        -- Frame.kind (well-known enum) and Frame.kind_str (custom label) are
+        -- parsed into stack_profile_frame.type; frames with no kind are NULL.
+        SELECT name, type
+        FROM stack_profile_frame
+        ORDER BY name;
+        """,
+        out=Csv("""
+        "name","type"
+        "custom_fn","custom"
+        "gc_fn","gc"
+        "interp_fn","interpreted"
+        "plain_fn","[NULL]"
+        """))
+
   def test_art_oome_stack_sample(self):
     return DiffTestBlueprint(
         trace=TextProto(r"""
@@ -664,17 +879,17 @@ class Profiling(TestSuite):
             oom_error_msg: "Failed to allocate 1048576 bytes"
             oom_thread_java_stack {
               frames {
-                method_name: "com.example.oometest.MainActivity.oomeInducer"
+                method_name: "void com.example.oometest.MainActivity.oomeInducer(int, java.lang.String)"
                 source_file: "MainActivity.java"
                 line_number: 45
               }
               frames {
-                method_name: "com.example.oometest.MainActivity.oomeInducer"
+                method_name: "com.example.oometest.MainActivity.oomeInducer(double)"
                 source_file: "MainActivity.java"
                 line_number: 42
               }
               frames {
-                method_name: "com.example.oometest.MainActivity.triggerOOM"
+                method_name: "void com.example.oometest.MainActivity.triggerOOM"
                 source_file: "MainActivity.java"
                 line_number: 31
               }

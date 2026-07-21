@@ -42,10 +42,12 @@
 #include "src/trace_processor/importers/common/registered_file_tracker.h"
 #include "src/trace_processor/importers/common/sched_event_tracker.h"
 #include "src/trace_processor/importers/common/slice_tracker.h"
+#include "src/trace_processor/importers/common/sparse_counter_tracker.h"
 #include "src/trace_processor/importers/common/stack_profile_tracker.h"
 #include "src/trace_processor/importers/common/state_tracker.h"
 #include "src/trace_processor/importers/common/stats_tracker.h"
 #include "src/trace_processor/importers/common/symbol_tracker.h"
+#include "src/trace_processor/importers/common/trace_diagnostics_tracker.h"
 #include "src/trace_processor/importers/common/trace_file_tracker.h"
 #include "src/trace_processor/importers/common/track_compressor.h"
 #include "src/trace_processor/importers/common/track_tracker.h"
@@ -86,6 +88,10 @@ void InitPerTraceAndMachineState(TraceProcessorContext* context,
       Ptr<ArgsTranslationTable>::MakeRoot(context->storage.get());
   context->metadata_tracker = Ptr<MetadataTracker>::MakeRoot(context);
   context->stats_tracker = Ptr<StatsTracker>::MakeRoot(context);
+  context->trace_diagnostics_tracker =
+      Ptr<TraceDiagnosticsTracker>::MakeRoot(context);
+  context->sparse_counter_tracker =
+      Ptr<SparseCounterTracker>::MakeRoot(context);
 
   context->slice_tracker->SetOnSliceBeginCallback(
       [context](TrackId track_id, SliceId slice_id) {
@@ -93,7 +99,7 @@ void InitPerTraceAndMachineState(TraceProcessorContext* context,
       });
 }
 
-void InitPerMachineState(TraceProcessorContext* context, uint32_t machine_id) {
+void InitPerMachineState(TraceProcessorContext* context, int64_t machine_id) {
   context->symbol_tracker = Ptr<SymbolTracker>::MakeRoot(context);
   context->machine_tracker = Ptr<MachineTracker>::MakeRoot(context, machine_id);
   context->process_tracker = Ptr<ProcessTracker>::MakeRoot(context);
@@ -148,6 +154,10 @@ Ptr<TraceSorter> CreateSorter(TraceProcessorContext* context,
     if (it != config.dev_flags.end() && it->second == "true") {
       event_handling = TraceSorter::EventHandling::kSortAndDrop;
     }
+    auto tok = config.dev_flags.find("tokenize-only");
+    if (tok != config.dev_flags.end() && tok->second == "true") {
+      event_handling = TraceSorter::EventHandling::kDrop;
+    }
   }
   return Ptr<TraceSorter>::MakeRoot(context, TraceSorter::SortingMode::kDefault,
                                     event_handling);
@@ -161,6 +171,8 @@ void InitGlobalState(TraceProcessorContext* context, const Config& config) {
       Ptr<GlobalStatsTracker>::MakeRoot(context->storage.get());
   context->sorter = CreateSorter(context, config);
   context->reader_registry = Ptr<TraceReaderRegistry>::MakeRoot();
+  context->trace_importer_registry =
+      context->reader_registry->importer_registry();
   context->global_args_tracker =
       Ptr<GlobalArgsTracker>::MakeRoot(context->storage.get());
   context->global_metadata_tracker =
@@ -197,6 +209,7 @@ void CopyGlobalState(const TraceProcessorContext* source,
   dest->storage = source->storage.Fork();
   dest->sorter = source->sorter.Fork();
   dest->reader_registry = source->reader_registry.Fork();
+  dest->trace_importer_registry = dest->reader_registry->importer_registry();
   dest->global_args_tracker = source->global_args_tracker.Fork();
   dest->global_metadata_tracker = source->global_metadata_tracker.Fork();
   dest->global_stats_tracker = source->global_stats_tracker.Fork();
@@ -232,7 +245,7 @@ TraceProcessorContext::~TraceProcessorContext() = default;
 
 TraceProcessorContext* TraceProcessorContext::ForkContextForTrace(
     TraceId trace_id,
-    uint32_t default_raw_machine_id) const {
+    int64_t default_raw_machine_id) const {
   auto [it, inserted] =
       forked_context_state->trace_and_machine_to_context.Insert(
           std::pair(trace_id.value, default_raw_machine_id), nullptr);
@@ -270,7 +283,7 @@ TraceProcessorContext* TraceProcessorContext::ForkContextForTrace(
 
 TraceProcessorContext*
 TraceProcessorContext::ForkContextForMachineInCurrentTrace(
-    uint32_t raw_machine_id) const {
+    int64_t raw_machine_id) const {
   PERFETTO_CHECK(trace_state);
   return ForkContextForTrace(trace_id(), raw_machine_id);
 }

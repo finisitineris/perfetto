@@ -22,7 +22,7 @@ import type {
   Transform1D,
   VerticalBounds,
 } from '../../base/geom';
-import {assertExists} from '../../base/assert';
+import {ensureExists} from '../../base/assert';
 import {Monitor} from '../../base/monitor';
 import {
   type CancellationSignal,
@@ -817,7 +817,11 @@ export class SliceTrack<T extends RowSchema> implements TrackRenderer {
     const bounds = this.bufferedBounds.update(visibleSpan, resolution);
 
     const {data: dataFrame} = this.dataFrameSlot.use({
+      // sqlSource is constant for most tracks with a static dataset, but
+      // there are cases (e.g. raw ftrace tracks) where the query can
+      // change dynamically.
       key: {
+        sqlSource,
         start: bounds.start,
         end: bounds.end,
         resolution: bounds.resolution,
@@ -1037,7 +1041,7 @@ export class SliceTrack<T extends RowSchema> implements TrackRenderer {
       depths[i] = depth;
       patterns[i] = isIncomplete
         ? RECT_PATTERN_FADE_RIGHT
-        : this.attrs.slicePattern?.(it) ?? 0;
+        : (this.attrs.slicePattern?.(it) ?? 0);
       slices[i] = {
         id,
         title,
@@ -1273,7 +1277,7 @@ export class SliceTrack<T extends RowSchema> implements TrackRenderer {
       this.trace.timeline.highlightedSliceName = this.hoveredSlice?.title;
       if (this.hoveredSlice === undefined) {
         if (this.attrs.onSliceOut) {
-          this.attrs.onSliceOut({slice: assertExists(prevHoveredSlice)});
+          this.attrs.onSliceOut({slice: ensureExists(prevHoveredSlice)});
         }
       } else {
         if (this.attrs.onSliceOver) {
