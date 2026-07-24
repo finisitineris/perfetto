@@ -31,11 +31,13 @@
 #include "src/trace_processor/importers/common/args_tracker.h"
 #include "src/trace_processor/importers/common/args_translation_table.h"
 #include "src/trace_processor/importers/common/clock_tracker.h"
+#include "src/trace_processor/importers/common/cpu_tracker.h"
 #include "src/trace_processor/importers/common/event_tracker.h"
 #include "src/trace_processor/importers/common/import_logs_tracker.h"
 #include "src/trace_processor/importers/common/mapping_tracker.h"
 #include "src/trace_processor/importers/common/parser_types.h"
 #include "src/trace_processor/importers/common/process_tracker.h"
+#include "src/trace_processor/importers/common/profiler_sample_tracker.h"
 #include "src/trace_processor/importers/common/stack_profile_tracker.h"
 #include "src/trace_processor/importers/common/stats_tracker.h"
 #include "src/trace_processor/importers/proto/packet_sequence_state_generation.h"
@@ -77,21 +79,6 @@ class StreamingProfileSink
   ProfileModule* module_;
 };
 
-// Adds a counter set containing the given counter IDs.
-// Returns the set ID that can be stored in PerfSampleTable.
-uint32_t AddCounterSet(TraceProcessorContext* context,
-                       const std::vector<CounterId>& counter_ids) {
-  auto* table = context->storage->mutable_perf_counter_set_table();
-  uint32_t set_id = static_cast<uint32_t>(table->row_count());
-  for (CounterId counter_id : counter_ids) {
-    tables::PerfCounterSetTable::Row row;
-    row.perf_counter_set_id = set_id;
-    row.counter_id = counter_id;
-    table->Insert(row);
-  }
-  return set_id;
-}
-
 struct InternedSmapsPath {
   StringId path_id = kNullStringId;
   StringId trimmed_path_id = kNullStringId;
@@ -124,6 +111,8 @@ ProfileModule::ProfileModule(ProtoImporterModuleContext* module_context,
                              TraceProcessorContext* context)
     : ProtoImporterModule(module_context),
       context_(context),
+      chrome_source_id_(context->storage->InternString("chrome")),
+      linux_perf_source_id_(context->storage->InternString("linux.perf")),
       perf_sample_tracker_(context),
       streaming_profile_stream_(context->sorter->CreateStream(
           std::make_unique<StreamingProfileSink>(this))) {
@@ -192,7 +181,7 @@ ModuleResult ProfileModule::TokenizeStreamingProfilePacket(
   for (auto callstack_it = decoder.callstack_iid(); callstack_it;
        ++callstack_it, ++timestamp_it) {
     if (!timestamp_it) {
-      context_->import_logs_tracker->RecordTokenizationError(
+      context_->import_logs_tracker->RecordTokenizationLog(
           stats::stackprofile_parser_error, packet->offset());
       break;
     }
@@ -228,7 +217,7 @@ void ProfileModule::ParseStreamingProfileSample(
   auto opt_cs_id = stack_profile_sequence_state.FindOrInsertCallstack(
       sequence_state, upid, event.callstack_iid);
   if (!opt_cs_id) {
-    context_->import_logs_tracker->RecordParserError(
+    context_->import_logs_tracker->RecordParserLog(
         stats::stackprofile_parser_error, ts,
         [&](ArgsTracker::BoundInserter& inserter) {
           inserter.AddArg(context_->storage->InternString("callstack_iid"),
@@ -237,10 +226,20 @@ void ProfileModule::ParseStreamingProfileSample(
     return;
   }
 
-  tables::CpuProfileStackSampleTable::Row sample_row{ts, *opt_cs_id, utid,
-                                                     event.process_priority};
-  context_->storage->mutable_cpu_profile_stack_sample_table()->Insert(
-      sample_row);
+  tables::ProfilerSampleTable::Row row;
+  row.ts = ts;
+  row.source = chrome_source_id_;
+  tables::ProfilerTaskContextTable::Row task_context;
+  task_context.utid = utid;
+  task_context.upid = upid;
+  row.task_context_id =
+      context_->profiler_sample_tracker->InternTaskContext(task_context);
+  row.callsite_id = *opt_cs_id;
+  auto sample_id = context_->profiler_sample_tracker->AddSample(row);
+  if (event.process_priority != 0) {
+    context_->storage->mutable_chrome_stack_sample_extras_table()->Insert(
+        {sample_id, event.process_priority});
+  }
 }
 
 void ProfileModule::ParsePerfSample(
@@ -331,11 +330,8 @@ void ProfileModule::ParsePerfSample(
     }
   }
 
-  // Create counter set if we have any counter IDs
-  std::optional<uint32_t> counter_set_id;
-  if (!counter_ids.empty()) {
-    counter_set_id = AddCounterSet(context_, counter_ids);
-  }
+  std::optional<uint32_t> counter_set_id =
+      context_->profiler_sample_tracker->AddCounterSet(counter_ids);
 
   const UniqueTid utid =
       context_->process_tracker->UpdateThread(sample.tid(), sample.pid());
@@ -355,8 +351,11 @@ void ProfileModule::ParsePerfSample(
   TraceStorage* storage = context_->storage.get();
 
   auto cpu_mode = static_cast<Profiling::CpuMode>(sample.cpu_mode());
-  StringPool::Id cpu_mode_id =
-      storage->InternString(ProfilePacketUtils::StringifyCpuMode(cpu_mode));
+  std::optional<StringPool::Id> cpu_mode_id;
+  if (cpu_mode != Profiling::MODE_UNKNOWN) {
+    cpu_mode_id =
+        storage->InternString(ProfilePacketUtils::StringifyCpuMode(cpu_mode));
+  }
 
   std::optional<StringPool::Id> unwind_error_id;
   if (sample.has_unwind_error()) {
@@ -365,10 +364,31 @@ void ProfileModule::ParsePerfSample(
     unwind_error_id = storage->InternString(
         ProfilePacketUtils::StringifyStackUnwindError(unwind_error));
   }
-  tables::PerfSampleTable::Row sample_row(
-      ts, utid, sample.cpu(), cpu_mode_id, cs_id, unwind_error_id,
-      sampling_stream.perf_session_id, counter_set_id);
-  context_->storage->mutable_perf_sample_table()->Insert(sample_row);
+
+  tables::ProfilerSampleTable::Row row;
+  row.ts = ts;
+  row.source = linux_perf_source_id_;
+  tables::ProfilerTaskContextTable::Row task_context;
+  task_context.utid = utid;
+  task_context.upid = upid;
+  row.task_context_id =
+      context_->profiler_sample_tracker->InternTaskContext(task_context);
+  tables::ProfilerExecutionContextTable::Row execution_context;
+  if (sample.has_cpu()) {
+    execution_context.ucpu =
+        context_->cpu_tracker->GetOrCreateCpu(sample.cpu()).value;
+  }
+  execution_context.cpu_mode = cpu_mode_id;
+  if (execution_context.ucpu || execution_context.cpu_mode) {
+    row.execution_context_id =
+        context_->profiler_sample_tracker->InternExecutionContext(
+            execution_context);
+  }
+  row.callsite_id = cs_id;
+  row.unwind_error = unwind_error_id;
+  row.session_id = sampling_stream.perf_session_id;
+  row.counter_set_id = counter_set_id;
+  context_->profiler_sample_tracker->AddSample(row);
 }
 
 void ProfileModule::ParseProfilePacket(
