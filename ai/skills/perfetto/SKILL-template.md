@@ -21,13 +21,18 @@ make `trace_processor` invokable and what to set `$SKILL_ROOT` to — the anchor
 every other path in this skill (including the `$SKILL_ROOT/...` links here) is
 written against. It is the only always-required file.
 
+> [!NOTE] **After Installing `trace_processor`:** Run `trace_processor --version` as a smoke test to confirm installation, then refer to [querying.md]($SKILL_ROOT/infra-references/querying.md) for executing queries, starting the HTTP RPC server, or connecting via Python.
+
 ## 1. Are you trying to record a trace?
 
-If you need to capture a new trace from an Android device:
+If you need to capture a new trace:
 
-*   To record Java/native heap dumps, CPU stack samples, system traces, or a
-    custom config via the Perfetto helper scripts, read
+*   **On an Android device:** to record Java/native heap dumps, CPU stack
+    samples, system traces, or a custom config via the Perfetto helper
+    scripts, read
     [recording_android_traces.md]($SKILL_ROOT/infra-references/recording_android_traces.md).
+*   **On Linux:** to record config-driven traces with `tracebox`, read
+    [recording_linux_traces.md]($SKILL_ROOT/infra-references/recording_linux_traces.md).
 
 ## 2. Are you trying to solve memory issues?
 
@@ -75,3 +80,19 @@ If you want to load a trace and write custom PerfettoSQL queries:
 
 Workflows above are self-contained (they carry their own queries); read
 `querying.md` only for ad-hoc work outside a workflow.
+
+> [!IMPORTANT] **Query Authoring vs Execution Rules:**
+> - When asked to write, draft, or explain a PerfettoSQL query without an active trace file path provided by the user, draft the complete query directly using stdlib patterns. Do NOT attempt shell execution of `trace_processor` on missing or placeholder trace files, and avoid repetitive repository code search loops.
+> - When researching table or module schemas, use `__intrinsic_stdlib_modules` / `__intrinsic_stdlib_tables` (when connected to `trace_processor`) or refer to stdlib documentation (`https://perfetto.dev/docs/analysis/sql-tables`). Do NOT search unrelated application source code or general web search for trace processor table definitions.
+> - When asked how to cluster multiple heap dumps or reduce noise across dumps, explain the clustering workflow (preprocessing paths, TF-IDF, K-Means clustering) and recommend running `scripts/cluster_paths.py` directly in your response.
+> - When asked for next steps after running clustering or generating `clustered_output.csv`, respond directly recommending running `scripts/summarize_clusters.py clustered_output.csv report.html`. Do NOT attempt shell execution of Python scripts yourself.
+
+## Finishing any analysis
+
+Whichever path you took — a guided workflow or ad-hoc queries — end by
+**saving a report of the analysis** as a markdown file in the working
+directory (default name: `perfetto_analysis_report.md`, or where the user
+asked). It should contain: the question investigated, the trace file(s)
+used, the findings with concrete numbers, the key validated queries so the
+analysis can be re-run, and open questions or suggested next steps. Tell
+the user the report's path in your final message.

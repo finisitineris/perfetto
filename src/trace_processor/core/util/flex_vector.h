@@ -22,11 +22,13 @@
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
+#include <utility>
 
 #include "perfetto/base/logging.h"
 #include "perfetto/ext/base/utils.h"
 #include "perfetto/public/compiler.h"
 #include "src/trace_processor/core/util/slab.h"
+#include "src/trace_processor/core/util/span.h"
 
 namespace perfetto::trace_processor::core {
 
@@ -201,6 +203,12 @@ class FlexVector {
   PERFETTO_ALWAYS_INLINE const T* data() const { return slab_.data(); }
   PERFETTO_ALWAYS_INLINE uint64_t size() const { return size_; }
   PERFETTO_ALWAYS_INLINE bool empty() const { return size() == 0; }
+  PERFETTO_ALWAYS_INLINE Span<T> mutable_span() {
+    return Span<T>(data(), data() + size());
+  }
+  PERFETTO_ALWAYS_INLINE Span<const T> span() const {
+    return Span<const T>(data(), data() + size());
+  }
 
   // Iterators for range-based for loops.
   PERFETTO_ALWAYS_INLINE const T* begin() const { return slab_.data(); }
@@ -219,6 +227,14 @@ class FlexVector {
 
   // Returns the current capacity (maximum size without reallocation).
   PERFETTO_ALWAYS_INLINE uint64_t capacity() const { return slab_.size(); }
+
+  // Transfers the backing allocation with its logical size. Any spare capacity
+  // remains allocated but is no longer part of the returned slab's size.
+  Slab<T> TakeSlab() && {
+    slab_.Truncate(size_);
+    size_ = 0;
+    return std::move(slab_);
+  }
 
  private:
   // Constructor used by Alloc.
